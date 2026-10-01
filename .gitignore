@@ -1,0 +1,26 @@
+### VisualStudioCode ###
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+
+
+### VisualStudio ###
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+
+# Build results
+build/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio cache
+.vs/

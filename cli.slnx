@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="src/addin/addin.vcxproj" Id="02c44285-590c-42f5-85e7-50710eef1ae5" />
+</Solution>

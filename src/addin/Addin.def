@@ -1,0 +1,6 @@
+; AddIn.def : Declare exported functions.
+
+LIBRARY addin
+EXPORTS
+    DllCanUnloadNow   PRIVATE
+    DllGetClassObject PRIVATE

@@ -27,8 +27,8 @@ scripting, CGI, static-file serving, and the C++ wrapper are disabled.
 The overlay adds a pre-allocation 1 MiB WebSocket frame limit; the addin also
 limits complete fragmented messages and HTTP JSON bodies to 1 MiB.
 
-Measured Release DLL sizes with this configuration: Win32 **284,672 bytes**
-(278 KiB), x64 **326,656 bytes** (319 KiB). CivetWeb is linked statically;
+Measured Release DLL sizes with this configuration: Win32 **342,528 bytes**
+(334 KiB), x64 **380,928 bytes** (372 KiB). CivetWeb is linked statically;
 there is no separate CivetWeb, gRPC, protobuf, OpenSSL, or zlib runtime DLL.
 
 ```powershell
@@ -113,19 +113,103 @@ schema or code-generation step is needed.
 
 ## JSON protocol
 
-The protocol is inspired by Chromium CDP's request/response shape, not a
-Chromium-compatible debugging implementation. There is no `jsonrpc` member.
+The HTTP interface is based on the
+[Chrome DevTools Protocol discovery interface](https://chromedevtools.github.io/devtools-protocol/),
+with document targets rather than browser tabs. This is not a Chromium-compatible
+debugging implementation. WebSocket request/response envelopes follow CDP's shape;
+there is no `jsonrpc` member.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /json/version` | Product/protocol version and `webSocketDebuggerUrl` |
-| `GET /json/list` or `/json` | One `powerpoint` target and its WebSocket URL |
+| `GET /json/version` | Office application/protocol/runtime metadata and application WebSocket URL |
+| `GET /json/list` or `/json` | Targets for all currently open presentation documents; empty array when none are open |
+| `PUT /json/new?url=<encoded-path-or-link>` | Open a local file or OneDrive/SharePoint link; absent or empty `url` creates a blank presentation |
+| `PUT /json/activate/{target}` | Activate the document and bring its window to the foreground |
+| `PUT /json/close/{target}` | Close a saved document; HTTP 409 when it has unsaved changes |
+| `PUT /json/close/{target}?force` | Discard changes and close the document without saving |
 | `POST /json/rpc` | One JSON request and response; requires `Content-Type: application/json` |
-| `WS /devtools/powerpoint` | UTF-8 JSON requests and correlated responses |
+| `WS /devtools/application` | Application-wide UTF-8 JSON requests and correlated responses |
 
 HTTP responses use `application/json; charset=utf-8`. WebSocket JSON uses text
 messages rather than an HTTP content type. With the default port, connect to
-`ws://127.0.0.1:50051/devtools/powerpoint`.
+`ws://127.0.0.1:50051/devtools/application`.
+
+`/json/protocol` is intentionally unavailable (HTTP 404).
+
+### Application metadata and document targets
+
+`/json/version` uses `Application` instead of CDP's `Browser` field. Its value
+contains the actual Office application name, version, build, and process architecture.
+`V8-Version` is `null` until QuickJS is integrated; no engine version is fabricated.
+For example:
+
+```json
+{
+  "Protocol-Version": "1.0",
+  "Application": "Microsoft PowerPoint/16.0 (build 20527; x86)",
+  "V8-Version": null,
+  "webSocketDebuggerUrl": "ws://127.0.0.1:50051/devtools/application"
+}
+```
+
+Each `/json/list` entry and successful `/json/new` response is a document descriptor:
+
+```json
+{
+  "id": "d17fd90d-90f8-4a29-b204-49495b78d064",
+  "type": "document",
+  "title": "Quarterly report.pptx",
+  "url": "C:\\Documents\\Quarterly report.pptx"
+}
+```
+
+Target IDs are opaque GUIDs, stable while the document remains open in the same
+addin connection, including after Save As. Closed/reopened documents get new IDs.
+Documents opened or closed outside the HTTP API are reflected on the next list.
+Never identify documents by a collection index or title. `url` is the Office
+document's full location, or empty for a never-saved document.
+
+The target concept is application-neutral: a presentation in PowerPoint, document
+in Word, or workbook in Excel. Only the PowerPoint adapter is implemented here.
+The WebSocket is application-wide; document descriptors do not advertise
+unimplemented document-specific sockets.
+
+### Creating, opening, activating, and closing
+
+Percent-encode the entire `url` query parameter, including spaces, Unicode,
+`+`, `#`, `&`, and any query parameters in a cloud link. The decoded value is
+passed unchanged to PowerPoint's `Presentations.Open`; Office owns file loading
+and OneDrive/SharePoint authentication. The addin does not download or rewrite links.
+Cloud opening requires an accessible link and the appropriate Office sign-in.
+
+```powershell
+$base = 'http://127.0.0.1:50051'
+$blank = Invoke-RestMethod -Method Put -Uri "$base/json/new"
+$url = [Uri]::EscapeDataString('C:\Documents\Quarterly report.pptx')
+$opened = Invoke-RestMethod -Method Put -Uri "$base/json/new?url=$url"
+Invoke-RestMethod -Method Put -Uri "$base/json/activate/$($opened.id)"
+Invoke-RestMethod -Method Put -Uri "$base/json/close/$($opened.id)"
+# Explicitly discard unsaved changes:
+Invoke-RestMethod -Method Put -Uri "$base/json/close/$($blank.id)?force"
+```
+
+HTTP `/json/new` creates Office's ordinary blank presentation with no added slides;
+the CLI `presentation new` retains its one-title-slide behavior.
+Activate and close return HTTP 200 with `{}`. The API rejects unsaved close with
+HTTP 409 without modifying the document's `Saved` state. The `force` parameter
+is a presence flag: `?force`, `?force=1`, and `?force=false` all authorize discard.
+No operation automatically saves a document.
+
+Malformed queries, duplicate `url`/`force` parameters, and invalid target IDs
+return HTTP 400. Unknown or closed targets return HTTP 404; there is no fallback
+to the active presentation. Unsupported verbs return HTTP 405 with `Allow`.
+Deadline expiry is HTTP 504, shutdown is HTTP 503, and COM failures are HTTP 500.
+Errors are JSON `{"error":{"code":...,"message":...,"data":...}}`, with optional
+HRESULT details. HTTP target requests have a 10-second queue deadline; a started
+Office call may outlive it. Inspect the document list before repeating a mutation.
+
+### Application WebSocket commands
+
 
 ```json
 {"id":1,"method":"PowerPoint.getStatus"}
@@ -159,8 +243,8 @@ the request ID; malformed JSON or an invalid ID produces `id: null`.
 | `-32003` | Connection cancelled or addin stopping |
 
 Use WebSocket for disconnect-sensitive mutations. CivetWeb's released server
-API cannot detect an HTTP POST client's disconnect while its handler waits for
-the STA, so an abandoned POST may still execute until its `timeoutMs` expires.
+API cannot detect an HTTP client's disconnect while its handler waits for
+the STA, so an abandoned POST or PUT may still execute until its queue deadline.
 Server shutdown cancels queued work on both transports.
 
 The endpoint is plaintext and unauthenticated, bound only to `127.0.0.1`.

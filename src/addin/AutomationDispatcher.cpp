@@ -9,6 +9,8 @@
 #include <exception>
 #include <new>
 #include <utility>
+#include <vector>
+#include <winver.h>
 
 namespace
 {
@@ -16,6 +18,26 @@ namespace
 	constexpr auto CancellationPollInterval = std::chrono::milliseconds(20);
 	constexpr size_t MaximumQueuedCalls = 128;
 	constexpr uint64_t MaximumSafeId = 9007199254740991ULL;
+	constexpr size_t MaximumHttpArgumentBytes = 1024 * 1024;
+
+	bool IsTargetId(const std::string &id)
+	{
+		if (id.size() != 36)
+			return false;
+		for (size_t index = 0; index < id.size(); ++index)
+		{
+			if (index == 8 || index == 13 || index == 18 || index == 23)
+			{
+				if (id[index] != '-')
+					return false;
+			}
+			else if (!((id[index] >= '0' && id[index] <= '9') ||
+				(id[index] >= 'a' && id[index] <= 'f') ||
+				(id[index] >= 'A' && id[index] <= 'F')))
+				return false;
+		}
+		return true;
+	}
 
 	bool IntegerInRange(const nlohmann::json &value, uint64_t minimum, uint64_t maximum)
 	{
@@ -125,12 +147,14 @@ nlohmann::json AutomationDispatcher::ErrorReply(const nlohmann::json &id, const 
 
 struct AutomationDispatcher::PendingCall
 {
-	enum class Operation { GetStatus, NewPresentation, SetSlideTitle };
+	enum class Operation { GetStatus, NewPresentation, SetSlideTitle, Http };
 	explicit PendingCall(Operation operation) : operation(operation) {}
 
 	Operation operation;
 	std::string text;
 	int slideIndex = 0;
+	HttpCommand httpCommand = HttpCommand::Version;
+	bool force = false;
 	nlohmann::json result;
 	std::shared_ptr<std::atomic_bool> cancelled;
 	std::chrono::steady_clock::time_point deadline;
@@ -235,6 +259,9 @@ void AutomationDispatcher::Stop()
 		UnregisterClassW(MAKEINTATOM(m_windowClass), m_hInstance);
 		m_windowClass = 0;
 	}
+	// Empty the member before releasing COM; Release may itself reenter disconnect.
+	std::vector<DocumentTarget> targets;
+	m_targets.swap(targets);
 	m_pApplication.Release();
 }
 
@@ -313,6 +340,48 @@ nlohmann::json AutomationDispatcher::HandleRequest(const nlohmann::json &request
 	catch (const std::exception &error)
 	{
 		return ErrorReply(id, ErrorStatus(-32000, E_FAIL, "PowerPoint request", error.what()));
+	}
+}
+
+nlohmann::json AutomationDispatcher::HandleHttpRequest(HttpCommand command,
+	const std::string &argument, bool force, const std::shared_ptr<std::atomic_bool> &cancelled)
+{
+	const auto received = std::chrono::steady_clock::now();
+	auto reply = [](const Status &status)
+	{
+		auto response = ErrorReply(nullptr, status);
+		response.erase("id");
+		return response;
+	};
+	try
+	{
+		if (argument.size() > MaximumHttpArgumentBytes || argument.find('\0') != std::string::npos)
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP document argument",
+				"Argument exceeds 1 MiB or contains a null character"));
+		if ((command == HttpCommand::Activate || command == HttpCommand::Close) && !IsTargetId(argument))
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP document target",
+				"Target must be a canonical GUID"));
+		if (command != HttpCommand::Version && command != HttpCommand::List &&
+			command != HttpCommand::New && command != HttpCommand::Activate && command != HttpCommand::Close)
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP command"));
+		auto call = std::make_shared<PendingCall>(PendingCall::Operation::Http);
+		call->httpCommand = command;
+		call->text = argument;
+		call->force = force;
+		call->cancelled = cancelled;
+		call->deadline = received + std::chrono::milliseconds(10000);
+		Status status = Dispatch(call);
+		if (!status.ok())
+			return reply(status);
+		return { { "result", std::move(call->result) } };
+	}
+	catch (const std::bad_alloc &)
+	{
+		return reply(ErrorStatus(-32000, E_OUTOFMEMORY, "HTTP document request"));
+	}
+	catch (const std::exception &error)
+	{
+		return reply(ErrorStatus(-32000, E_FAIL, "HTTP document request", error.what()));
 	}
 }
 
@@ -443,6 +512,8 @@ void AutomationDispatcher::DispatchOnSta()
 					result["processId"] = GetCurrentProcessId();
 				else if (call->operation == PendingCall::Operation::NewPresentation)
 					status = CreatePresentation(call->text, result);
+				else if (call->operation == PendingCall::Operation::Http)
+					status = DispatchHttp(call->httpCommand, call->text, call->force, result);
 				else
 					status = UpdateSlideTitle(call->slideIndex, call->text);
 				// A running COM call may complete after cancellation, but its late
@@ -567,6 +638,362 @@ AutomationDispatcher::Status AutomationDispatcher::GetInteger(IDispatch *object,
 	if (FAILED(hr))
 		return ErrorStatus(-32000, hr, MemberName(name));
 	result = value.lVal;
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetString(IDispatch *object,
+	const wchar_t *name, std::string &result)
+{
+	ATL::CComVariant value;
+	Status status = Invoke(object, name, DISPATCH_PROPERTYGET, nullptr, 0, &value);
+	if (!status.ok())
+		return status;
+	if (value.vt != VT_BSTR)
+		return ErrorStatus(-32000, DISP_E_TYPEMISMATCH, MemberName(name));
+	HRESULT hr = BstrToUtf8(value.bstrVal, result);
+	if (FAILED(hr))
+		return ErrorStatus(-32000, hr, MemberName(name), "Invalid Unicode string");
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetExecutableBuild(IDispatch *application,
+	std::string &result)
+{
+	ATL::CComVariant path;
+	Status status = Invoke(application, L"Path", DISPATCH_PROPERTYGET, nullptr, 0, &path);
+	if (!status.ok())
+		return status;
+	if (path.vt != VT_BSTR)
+		return ErrorStatus(-32000, DISP_E_TYPEMISMATCH, "PowerPoint.Path");
+	std::wstring executable(path.bstrVal, SysStringLen(path.bstrVal));
+	if (executable.empty())
+		return ErrorStatus(-32000, E_UNEXPECTED, "PowerPoint.Path", "Office returned an empty program path");
+	if (executable.back() != L'\\' && executable.back() != L'/')
+		executable.push_back(L'\\');
+	executable += L"POWERPNT.EXE";
+	DWORD ignored = 0;
+	DWORD bytes = GetFileVersionInfoSizeW(executable.c_str(), &ignored);
+	if (bytes == 0)
+		return ErrorStatus(-32000, HRESULT_FROM_WIN32(GetLastError()), "Reading POWERPNT.EXE version");
+	std::vector<BYTE> buffer(bytes);
+	if (!GetFileVersionInfoW(executable.c_str(), 0, bytes, buffer.data()))
+		return ErrorStatus(-32000, HRESULT_FROM_WIN32(GetLastError()), "Reading POWERPNT.EXE version");
+	VS_FIXEDFILEINFO *version = nullptr;
+	UINT size = 0;
+	if (!VerQueryValueW(buffer.data(), L"\\", reinterpret_cast<void **>(&version), &size) ||
+		version == nullptr || size < sizeof(VS_FIXEDFILEINFO) || version->dwSignature != 0xFEEF04BD)
+		return ErrorStatus(-32000, E_UNEXPECTED, "Reading POWERPNT.EXE version",
+			"Executable has no valid fixed file version");
+	result = std::to_string(HIWORD(version->dwFileVersionMS)) + "." +
+		std::to_string(LOWORD(version->dwFileVersionMS)) + "." +
+		std::to_string(HIWORD(version->dwFileVersionLS)) + "." +
+		std::to_string(LOWORD(version->dwFileVersionLS));
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::ApplicationMetadata(nlohmann::json &result)
+{
+	ATL::CComPtr<IDispatch> application = m_pApplication;
+	std::string name;
+	Status status = GetString(application, L"Name", name);
+	if (!status.ok())
+		return status;
+	std::string version;
+	status = GetString(application, L"Version", version);
+	if (!status.ok())
+		return status;
+	std::string build;
+	status = GetString(application, L"Build", build);
+	if (!status.ok())
+	{
+		// Older Office type libraries may omit Build; never substitute the addin's version.
+		if (status.data.value("hresult", std::string()) != "0x80020006" &&
+			status.data.value("hresult", std::string()) != "0x80020003")
+			return status;
+		status = GetExecutableBuild(application, build);
+		if (!status.ok())
+			return status;
+	}
+#if defined(_WIN64)
+	const char *architecture = "x64";
+#else
+	const char *architecture = "x86";
+#endif
+	result = { { "Application", name + "/" + version + " (build " + build + "; " + architecture + ")" },
+		{ "V8-Version", nullptr } };
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::DescribeDocument(IDispatch *document,
+	const std::string &id, nlohmann::json &result)
+{
+	std::string title;
+	Status status = GetString(document, L"Name", title);
+	if (!status.ok())
+		return status;
+	std::string path;
+	status = GetString(document, L"Path", path);
+	if (!status.ok())
+		return status;
+	std::string url;
+	// FullName is only a title for never-saved documents, not a resolvable location.
+	if (!path.empty())
+	{
+		status = GetString(document, L"FullName", url);
+		if (!status.ok())
+			return status;
+	}
+	result = { { "id", id }, { "type", "document" }, { "title", std::move(title) },
+		{ "url", std::move(url) } };
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::RefreshTargets(nlohmann::json &result)
+{
+	ATLASSERT(m_ownerThreadId == GetCurrentThreadId());
+	// A COM call can reenter Stop; never iterate the member cache across such a call.
+	const auto previous = m_targets;
+	ATL::CComPtr<IDispatch> application = m_pApplication;
+	ATL::CComPtr<IDispatch> presentations;
+	Status status = GetObject(application, L"Presentations", presentations);
+	if (!status.ok())
+		return status;
+	long count = 0;
+	status = GetInteger(presentations, L"Count", count);
+	if (!status.ok())
+		return status;
+	if (count < 0)
+		return ErrorStatus(-32000, E_UNEXPECTED, "PowerPoint.Presentations.Count");
+	std::vector<DocumentTarget> snapshot;
+	snapshot.reserve(static_cast<size_t>(count));
+	auto descriptors = nlohmann::json::array();
+	for (long index = 1; index <= count; ++index)
+	{
+		ATL::CComVariant argument(index);
+		ATL::CComVariant value;
+		status = Invoke(presentations, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &argument, 1, &value);
+		if (!status.ok())
+			return status;
+		DocumentTarget target;
+		status = ReadObject(value, L"Presentations.Item", target.document, -32000);
+		if (!status.ok())
+			return status;
+		HRESULT hr = target.document->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&target.identity));
+		if (IsStopping())
+			return StoppedStatus();
+		if (FAILED(hr))
+			return ErrorStatus(-32000, hr, "Presentation canonical identity");
+		auto existing = std::find_if(previous.begin(), previous.end(), [&target](const DocumentTarget &entry)
+		{
+			return entry.identity.p == target.identity.p;
+		});
+		std::string id;
+		if (existing != previous.end())
+			id = existing->descriptor["id"].get<std::string>();
+		else
+		{
+			GUID guid;
+			hr = CoCreateGuid(&guid);
+			if (FAILED(hr))
+				return ErrorStatus(-32000, hr, "Creating document target id");
+			wchar_t text[39];
+			if (StringFromGUID2(guid, text, _countof(text)) == 0)
+				return ErrorStatus(-32000, E_UNEXPECTED, "Formatting document target id");
+			id.reserve(36);
+			for (size_t character = 1; character <= 36; ++character)
+			{
+				char digit = static_cast<char>(text[character]);
+				id.push_back(digit >= 'A' && digit <= 'F' ? digit + ('a' - 'A') : digit);
+			}
+		}
+		status = DescribeDocument(target.document, id, target.descriptor);
+		if (!status.ok())
+			return status;
+		descriptors.push_back(target.descriptor);
+		snapshot.push_back(std::move(target));
+	}
+	if (IsStopping())
+		return StoppedStatus();
+	m_targets.swap(snapshot);
+	result = std::move(descriptors);
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::OpenDocument(const std::string &argument,
+	nlohmann::json &result)
+{
+	HRESULT hr = S_OK;
+	ATL::CComPtr<IDispatch> application = m_pApplication;
+	ATL::CComPtr<IDispatch> presentations;
+	Status status = GetObject(application, L"Presentations", presentations);
+	if (!status.ok())
+		return status;
+	ATL::CComVariant value;
+	if (argument.empty())
+	{
+		ATL::CComVariant withWindow(-1L); // msoTrue; Office's normal blank presentation, no slides added.
+		status = Invoke(presentations, L"Add", DISPATCH_METHOD, &withWindow, 1, &value);
+	}
+	else
+	{
+		// IDispatch reverses FileName, ReadOnly, Untitled, WithWindow.
+		ATL::CComVariant arguments[4] = { ATL::CComVariant(-1L), ATL::CComVariant(0L),
+			ATL::CComVariant(0L), ATL::CComVariant() };
+		hr = Utf8ToVariant(argument, arguments[3]);
+		if (FAILED(hr))
+			return ErrorStatus(hr == E_OUTOFMEMORY ? -32000 : -32602, hr, "Decoding document URL as UTF-8");
+		status = Invoke(presentations, L"Open", DISPATCH_METHOD, arguments, 4, &value);
+	}
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IDispatch> document;
+	status = ReadObject(value, argument.empty() ? L"Presentations.Add" : L"Presentations.Open", document, -32000);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IUnknown> identity;
+	hr = document->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&identity));
+	if (IsStopping())
+		return StoppedStatus();
+	if (FAILED(hr))
+		return ErrorStatus(-32000, hr, "Presentation canonical identity");
+	nlohmann::json list;
+	status = RefreshTargets(list);
+	if (!status.ok())
+		return status;
+	auto target = std::find_if(m_targets.begin(), m_targets.end(), [&identity](const DocumentTarget &entry)
+	{
+		return entry.identity.p == identity.p;
+	});
+	if (target == m_targets.end())
+		return ErrorStatus(-32004, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "New document target",
+			"The opened document is no longer available");
+	result = target->descriptor;
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::ActivateDocument(IDispatch *document)
+{
+	ATL::CComPtr<IDispatch> windows;
+	Status status = GetObject(document, L"Windows", windows);
+	if (!status.ok())
+		return status;
+	ATL::CComVariant index(1L);
+	ATL::CComVariant value;
+	status = Invoke(windows, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &index, 1, &value);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IDispatch> window;
+	status = ReadObject(value, L"Windows.Item", window, -32000);
+	if (!status.ok())
+		return status;
+	// Bring Office to the foreground before selecting the document. Activating
+	// the previous frame afterward would switch back to its presentation.
+	HWND nativeWindow = GetActiveWindow();
+	if (!IsWindow(nativeWindow))
+		return ErrorStatus(-32000, HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE), "Document window activation");
+	HWND root = GetAncestor(nativeWindow, GA_ROOT);
+	if (IsIconic(root))
+		ShowWindow(root, SW_RESTORE);
+	if (GetForegroundWindow() != root)
+		SetForegroundWindow(root);
+	if (GetForegroundWindow() != root)
+	{
+		// The Office STA can temporarily share foreground input to honor explicit activation.
+		DWORD foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+		bool attached = foregroundThread != 0 && foregroundThread != GetCurrentThreadId() &&
+			AttachThreadInput(GetCurrentThreadId(), foregroundThread, TRUE) != FALSE;
+		SetForegroundWindow(root);
+		if (attached)
+			AttachThreadInput(GetCurrentThreadId(), foregroundThread, FALSE);
+	}
+	if (IsStopping())
+		return StoppedStatus();
+	if (GetForegroundWindow() != root)
+		return ErrorStatus(-32000, HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED), "Document window activation",
+			"Windows refused to bring the document window to the foreground");
+	status = Invoke(window, L"Activate", DISPATCH_METHOD, nullptr, 0, nullptr);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IDispatch> application = m_pApplication;
+	ATL::CComPtr<IDispatch> activeDocument;
+	status = GetObject(application, L"ActivePresentation", activeDocument);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IUnknown> activeIdentity, targetIdentity;
+	HRESULT hr = activeDocument->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&activeIdentity));
+	if (SUCCEEDED(hr))
+		hr = document->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&targetIdentity));
+	if (IsStopping())
+		return StoppedStatus();
+	if (FAILED(hr))
+		return ErrorStatus(-32000, hr, "Document activation identity");
+	if (activeIdentity == nullptr || activeIdentity.p != targetIdentity.p ||
+		GetForegroundWindow() != GetAncestor(GetActiveWindow(), GA_ROOT))
+		return ErrorStatus(-32000, E_FAIL, "Document window activation",
+			"Office did not activate the requested document in the foreground");
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::DispatchHttp(HttpCommand command,
+	const std::string &argument, bool force, nlohmann::json &result)
+{
+	if (command == HttpCommand::Version)
+		return ApplicationMetadata(result);
+	if (command == HttpCommand::New)
+		return OpenDocument(argument, result);
+	nlohmann::json list;
+	Status status = RefreshTargets(list);
+	if (!status.ok())
+		return status;
+	if (command == HttpCommand::List)
+	{
+		result = std::move(list);
+		return {};
+	}
+	std::string id = argument;
+	for (char &character : id)
+		if (character >= 'A' && character <= 'F')
+			character += 'a' - 'A';
+	auto position = std::find_if(m_targets.begin(), m_targets.end(), [&id](const DocumentTarget &target)
+	{
+		return target.descriptor["id"] == id;
+	});
+	if (position == m_targets.end())
+		return ErrorStatus(-32004, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Document target",
+			"Unknown or closed document target");
+	// Retain both references locally before any reentrant COM call.
+	ATL::CComPtr<IDispatch> document = position->document;
+	ATL::CComPtr<IUnknown> identity = position->identity;
+	if (command == HttpCommand::Activate)
+		return ActivateDocument(document);
+	if (!force)
+	{
+		long saved = 0;
+		status = GetInteger(document, L"Saved", saved);
+		if (!status.ok())
+			return status;
+		if (saved != -1) // msoTrue
+			return ErrorStatus(-32005, HRESULT_FROM_WIN32(ERROR_CANCELLED), "Closing document",
+				"Document has unsaved changes; use the force query flag to discard them");
+	}
+	else
+	{
+		ATL::CComVariant saved(-1L); // Mark clean immediately before Close, without saving.
+		status = Invoke(document, L"Saved", DISPATCH_PROPERTYPUT, &saved, 1, nullptr);
+		if (!status.ok())
+			return status;
+	}
+	status = Invoke(document, L"Close", DISPATCH_METHOD, nullptr, 0, nullptr);
+	if (!status.ok())
+		return status;
+	status = RefreshTargets(list);
+	if (!status.ok())
+		return status;
+	if (std::any_of(m_targets.begin(), m_targets.end(), [&identity](const DocumentTarget &target)
+	{
+		return target.identity.p == identity.p;
+	}))
+		return ErrorStatus(-32000, E_ABORT, "Closing document", "Office kept the document open");
 	return {};
 }
 

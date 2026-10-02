@@ -66,7 +66,7 @@
   <ItemDefinitionGroup>
     <Link>
       <ModuleDefinitionFile>$(ProjectDir)addin.def</ModuleDefinitionFile>
-      <AdditionalDependencies>civetweb.lib;Ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>civetweb.lib;Ws2_32.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ImportGroup Label="ExtensionSettings">

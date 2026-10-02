@@ -52,7 +52,7 @@ async function main() {
     throw new Error('powerpoint launch is supported only on Windows with desktop Microsoft PowerPoint installed.');
   }
   const { Connection, deadlineError, retryable } = require('../lib/connection');
-  const endpoint = `ws://127.0.0.1:${options.port}/devtools/powerpoint`;
+  const endpoint = `ws://127.0.0.1:${options.port}/devtools/application`;
   const deadline = Date.now() + options.timeout;
   let client;
   const connect = async end => {

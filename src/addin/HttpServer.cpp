@@ -19,6 +19,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -27,7 +28,7 @@ namespace
 	constexpr size_t MaxSessions = 32;
 	constexpr size_t MaxQueuedMessages = 16;
 	constexpr size_t MaxQueuedBytes = 4 * MaxMessageBytes;
-	constexpr char NativeFailure[] = "{\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Native request handling failed\"}}";
+	constexpr char NativeFailure[] = "{\"error\":{\"code\":-32000,\"message\":\"Native request handling failed\"}}";
 	std::mutex LibraryMutex;
 
 	bool EqualAscii(std::string_view left, std::string_view right)
@@ -105,6 +106,117 @@ namespace
 		return Json{{"id", id}, {"error", {{"code", code}, {"message", message}}}};
 	}
 
+	Json HttpErrorReply(int code, const char *message)
+	{
+		return Json{{"error", {{"code", code}, {"message", message}}}};
+	}
+
+	enum class Endpoint { Unknown, Rpc, WebSocket, Version, List, New, Activate, Close };
+
+	std::string_view RequestPath(const mg_request_info &request)
+	{
+		// Automatic URI decoding is disabled: retain the unnormalized path so
+		// malformed targets cannot be cleaned or truncated into another route.
+		return request.local_uri_raw == nullptr ? std::string_view() : request.local_uri_raw;
+	}
+
+	Endpoint IdentifyEndpoint(std::string_view path)
+	{
+		if (path == "/json/rpc") return Endpoint::Rpc;
+		if (path == "/devtools/application") return Endpoint::WebSocket;
+		if (path == "/json/version") return Endpoint::Version;
+		if (path == "/json" || path == "/json/list") return Endpoint::List;
+		if (path == "/json/new") return Endpoint::New;
+		if (path == "/json/activate" || path.substr(0, 15) == "/json/activate/") return Endpoint::Activate;
+		if (path == "/json/close" || path.substr(0, 12) == "/json/close/") return Endpoint::Close;
+		return Endpoint::Unknown;
+	}
+
+	const char *EndpointMethod(Endpoint endpoint)
+	{
+		if (endpoint == Endpoint::Rpc) return "POST";
+		if (endpoint == Endpoint::New || endpoint == Endpoint::Activate || endpoint == Endpoint::Close) return "PUT";
+		return "GET";
+	}
+
+	bool IsHex(char value)
+	{
+		return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') ||
+			(value >= 'A' && value <= 'F');
+	}
+
+	bool ParseHttpQuery(const char *query, std::string &url, bool &force, const char *&error)
+	{
+		if (query == nullptr || *query == '\0') return true;
+		std::string data(query);
+		if (data.size() > MaxMessageBytes)
+		{
+			error = "Query exceeds the 1 MiB limit";
+			return false;
+		}
+		// CivetWeb's decoder preserves malformed percent escapes and permits NUL.
+		// Validate only the encoding here; the library splits and decodes the query.
+		for (size_t i = 0; i < data.size(); ++i)
+		{
+			if (data[i] != '%') continue;
+			if (data.size() - i < 3 || !IsHex(data[i + 1]) || !IsHex(data[i + 2]))
+			{
+				error = "Malformed percent encoding in query";
+				return false;
+			}
+			if (data[i + 1] == '0' && data[i + 2] == '0')
+			{
+				error = "Query must not contain a NUL character";
+				return false;
+			}
+			i += 2;
+		}
+		const int count = mg_split_form_urlencoded(data.data(), nullptr, 0);
+		if (count <= 0)
+		{
+			error = "Unable to parse query";
+			return false;
+		}
+		std::vector<mg_header> fields(static_cast<size_t>(count));
+		const int parsed = mg_split_form_urlencoded(data.data(), fields.data(), static_cast<unsigned>(fields.size()));
+		if (parsed < 0)
+		{
+			error = "Unable to parse query";
+			return false;
+		}
+		bool hasUrl = false;
+		for (int i = 0; i < parsed; ++i)
+		{
+			const auto &field = fields[static_cast<size_t>(i)];
+			if (std::string_view(field.name) == "url")
+			{
+				if (hasUrl) { error = "Duplicate url query parameter"; return false; }
+				hasUrl = true;
+				url = field.value == nullptr ? "" : field.value;
+			}
+			else if (std::string_view(field.name) == "force")
+			{
+				if (force) { error = "Duplicate force query parameter"; return false; }
+				// Presence authorizes discard, including ?force and ?force=false.
+				force = true;
+			}
+		}
+		return true;
+	}
+
+	int HttpErrorStatus(int code)
+	{
+		switch (code)
+		{
+		case -32602: return 400;
+		case -32004: return 404;
+		case -32005: return 409;
+		case -32002: return 504;
+		case -32003: return 503;
+		default: return 500;
+		}
+	}
+
 	// This is the documented CivetWeb response API, including upgrade denials.
 	// v1.16's response-header builders reject connections already marked as WebSocket,
 	// even before the handshake; mg_printf/mg_write remain available in begin_request.
@@ -123,7 +235,9 @@ namespace
 
 	int ProtocolError(mg_connection *connection, int status, const char *message, const char *allow = nullptr)
 	{
-		return SendHttp(connection, status, ErrorReply(nullptr, -32600, message).dump(), allow);
+		const bool rpc = IdentifyEndpoint(RequestPath(*mg_get_request_info(connection))) == Endpoint::Rpc;
+		return SendHttp(connection, status,
+			(rpc ? ErrorReply(nullptr, -32600, message) : HttpErrorReply(-32600, message)).dump(), allow);
 	}
 
 	std::string HandleEnvelope(const std::string &text, const std::shared_ptr<AutomationDispatcher> &dispatcher,
@@ -400,7 +514,7 @@ struct HttpServer::State
 		{
 			auto &state = From(connection);
 			if (!state.ready.load() || state.stopping.load())
-				return SendHttp(connection, 503, ErrorReply(nullptr, -32000, "Server is stopping").dump());
+				return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
 			const auto &request = *mg_get_request_info(connection);
 			// The literal listening address guarantees the local address; reject non-IPv4
 			// loopback peers as well. IPv6 and TLS are not enabled in this library build.
@@ -409,12 +523,12 @@ struct HttpServer::State
 				return ProtocolError(connection, 403, "Only the selected IPv4 loopback endpoint is allowed");
 			if (!AllowedOrigin(request, state.port))
 				return ProtocolError(connection, 403, "Origin is not local to this endpoint");
-			std::string_view path(request.local_uri == nullptr ? "" : request.local_uri);
-			bool discovery = path == "/json" || path == "/json/list" || path == "/json/version";
-			bool rpc = path == "/json/rpc", websocket = path == "/devtools/powerpoint";
-			if (!discovery && !rpc && !websocket) return ProtocolError(connection, 404, "Unknown endpoint");
-			if (std::string_view(request.request_method) != (rpc ? "POST" : "GET"))
-				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint", rpc ? "POST" : "GET");
+			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request));
+			const bool websocket = endpoint == Endpoint::WebSocket;
+			if (endpoint == Endpoint::Unknown) return ProtocolError(connection, 404, "Unknown endpoint");
+			const char *method = EndpointMethod(endpoint);
+			if (std::string_view(request.request_method) != method)
+				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint", method);
 			if (websocket)
 			{
 				if (std::string_view(request.http_version) != "1.1" ||
@@ -426,15 +540,12 @@ struct HttpServer::State
 			}
 			else if (!Header(connection, "Upgrade").empty())
 				return ProtocolError(connection, 400, "This endpoint does not support protocol upgrades");
-			if (rpc || websocket)
-			{
-				auto session = state.Add(connection);
-				if (session == nullptr)
-					return SendHttp(connection, 503, ErrorReply(nullptr, -32000, "Server session capacity is exhausted").dump());
-				// Allocate all owned threads before accepting the upgrade. They cannot send
-				// until the ready callback, and handshake failure is cleaned by end_request.
-				if (websocket) session->StartWorkers();
-			}
+			auto session = state.Add(connection);
+			if (session == nullptr)
+				return SendHttp(connection, 503, HttpErrorReply(-32000, "Server session capacity is exhausted").dump());
+			// Allocate all owned threads before accepting the upgrade. They cannot send
+			// until the ready callback, and handshake failure is cleaned by end_request.
+			if (websocket) session->StartWorkers();
 			return 0;
 		}
 		catch (const std::bad_alloc &)
@@ -460,8 +571,9 @@ struct HttpServer::State
 	int RouteHttp(mg_connection *connection)
 	{
 		const auto &request = *mg_get_request_info(connection);
-		std::string_view path(request.local_uri == nullptr ? "" : request.local_uri);
-		if (path == "/json/rpc")
+		std::string_view path = RequestPath(request);
+		const Endpoint endpoint = IdentifyEndpoint(path);
+		if (endpoint == Endpoint::Rpc)
 		{
 			auto session = Find(connection);
 			if (session == nullptr || session->cancelled->load()) return SendHttp(connection, 503, NativeFailure);
@@ -490,15 +602,66 @@ struct HttpServer::State
 			std::string reply = HandleEnvelope(body, dispatcher, session->cancelled);
 			return session->cancelled->load() ? 503 : SendHttp(connection, 200, reply);
 		}
-		const std::string url = "ws://127.0.0.1:" + std::to_string(port) + "/devtools/powerpoint";
+		auto session = Find(connection);
+		if (session == nullptr || session->cancelled->load())
+			return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
+		std::string argument;
+		bool force = false;
+		const char *queryError = nullptr;
+		if (!ParseHttpQuery(request.query_string, argument, force, queryError))
+			return SendHttp(connection, 400, HttpErrorReply(-32602, queryError).dump());
+		AutomationDispatcher::HttpCommand command;
+		switch (endpoint)
+		{
+		case Endpoint::Version: command = AutomationDispatcher::HttpCommand::Version; argument.clear(); break;
+		case Endpoint::List: command = AutomationDispatcher::HttpCommand::List; argument.clear(); break;
+		case Endpoint::New: command = AutomationDispatcher::HttpCommand::New; break;
+		case Endpoint::Activate:
+			command = AutomationDispatcher::HttpCommand::Activate;
+			argument = path.size() > 15 ? std::string(path.substr(15)) : "";
+			break;
+		case Endpoint::Close:
+			command = AutomationDispatcher::HttpCommand::Close;
+			argument = path.size() > 12 ? std::string(path.substr(12)) : "";
+			break;
+		default: return ProtocolError(connection, 404, "Unknown endpoint");
+		}
+		if ((endpoint == Endpoint::Activate || endpoint == Endpoint::Close) && !argument.empty())
+		{
+			// Decode exactly once with the library, retaining the returned byte count
+			// so an encoded NUL cannot truncate a target into an otherwise valid GUID.
+			const int length = mg_url_decode(argument.data(), static_cast<int>(argument.size()),
+				argument.data(), static_cast<int>(argument.size() + 1), 0);
+			if (length < 0)
+				return SendHttp(connection, 400, HttpErrorReply(-32602, "Unable to decode target").dump());
+			argument.resize(static_cast<size_t>(length));
+			if (argument.find('\0') != std::string::npos)
+				return SendHttp(connection, 400, HttpErrorReply(-32602, "Target must not contain a NUL character").dump());
+		}
+		Json envelope = dispatcher->HandleHttpRequest(command, argument, endpoint == Endpoint::Close && force, session->cancelled);
+		if (session->cancelled->load())
+			return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
+		int status = 200;
 		Json reply;
-		if (path == "/json/version")
-			reply = {{"Browser", "NetOffice/1.0"}, {"Protocol-Version", "1.0"}, {"webSocketDebuggerUrl", url}};
-		else if (path == "/json" || path == "/json/list")
-			reply = Json::array({{{"id", "powerpoint"}, {"type", "powerpoint"}, {"title", "PowerPoint"},
-				{"url", ""}, {"webSocketDebuggerUrl", url}}});
-		else return ProtocolError(connection, 404, "Unknown endpoint");
-		return SendHttp(connection, 200, reply.dump());
+		auto error = envelope.find("error");
+		if (error != envelope.end())
+		{
+			status = HttpErrorStatus(error->value("code", -32000));
+			reply = {{"error", *error}};
+		}
+		else
+		{
+			reply = envelope.at("result");
+			if (endpoint == Endpoint::Version)
+			{
+				reply["Protocol-Version"] = "1.0";
+				reply["webSocketDebuggerUrl"] = "ws://127.0.0.1:" + std::to_string(port) + "/devtools/application";
+			}
+		}
+		std::string body = reply.dump();
+		if (body.size() > MaxMessageBytes)
+			return SendHttp(connection, 500, HttpErrorReply(-32000, "Reply exceeds the 1 MiB limit").dump());
+		return SendHttp(connection, status, body);
 	}
 
 	static int WebSocketConnect(const mg_connection *connection, void *data) noexcept
@@ -649,6 +812,8 @@ HRESULT HttpServer::Start(IDispatch *app, unsigned short port)
 			"enable_websocket_ping_pong", "yes",
 			"enable_keep_alive", "no",
 			"tcp_nodelay", "1",
+			"decode_url", "no",
+			"decode_query_string", "no",
 			"access_control_allow_origin", "",
 			"access_control_allow_methods", "",
 			"access_control_allow_headers", "",
@@ -669,7 +834,7 @@ HRESULT HttpServer::Start(IDispatch *app, unsigned short port)
 			return E_FAIL;
 		}
 		mg_set_request_handler(state->context, "/", State::HttpRequest, state.get());
-		mg_set_websocket_handler(state->context, "/devtools/powerpoint", State::WebSocketConnect,
+		mg_set_websocket_handler(state->context, "/devtools/application", State::WebSocketConnect,
 			State::WebSocketReady, State::WebSocketData, State::WebSocketClose, state.get());
 		// The pinned CivetWeb build rejects any frame payload above 1 MiB before it
 		// allocates the frame buffer; Session::Receive also caps aggregate fragments.

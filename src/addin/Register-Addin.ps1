@@ -10,7 +10,10 @@ param(
     [ValidateSet('x86', 'x64')]
     [string] $Architecture,
 
-    [string] $DllPath
+    [string] $DllPath,
+
+    [ValidateRange(1, 65535)]
+    [int] $Port = 50051
 )
 
 Set-StrictMode -Version Latest
@@ -67,6 +70,7 @@ try {
                 FriendlyName = 'NetOffice Automate'
                 Description = 'Minimal NetOffice PowerPoint COM addin'
                 LoadBehavior = 3
+                ServerPort = $Port
             }
         }
         foreach ($path in $values.Keys) {

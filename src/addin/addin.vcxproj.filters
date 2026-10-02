@@ -24,7 +24,10 @@
     <ClInclude Include="Connect.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="GrpcServer.h">
+    <ClInclude Include="HttpServer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AutomationDispatcher.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -35,13 +38,10 @@
     <ClCompile Include="Connect.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="GrpcServer.cpp">
+    <ClCompile Include="HttpServer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="$(IntDir)netoffice.pb.cc">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="$(IntDir)netoffice.grpc.pb.cc">
+    <ClCompile Include="AutomationDispatcher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="pch.cpp">
@@ -54,6 +54,9 @@
     </None>
     <None Include="Register-Addin.ps1" />
     <None Include="vcpkg.json" />
-    <None Include="..\proto\netoffice.proto" />
+    <None Include="vcpkg-configuration.json" />
+    <None Include="vcpkg-overlay\civetweb\vcpkg.json" />
+    <None Include="vcpkg-overlay\civetweb\portfile.cmake" />
+    <None Include="vcpkg-overlay\civetweb\limit-websocket-frame.patch" />
   </ItemGroup>
 </Project>

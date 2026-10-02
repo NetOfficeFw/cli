@@ -1,0 +1,36 @@
+diff --git a/src/civetweb.c b/src/civetweb.c
+--- a/src/civetweb.c
++++ b/src/civetweb.c
+@@ -12874,15 +12874,6 @@ read_websocket(struct mg_connection *conn,
+ 				header_len = 10 + mask_len;
+ 				data_len = (((uint64_t)ntohl(l1)) << 32) + ntohl(l2);
+-
+-				if (data_len > (uint64_t)0x7FFF0000ul) {
+-					/* no can do */
+-					mg_cry_internal(
+-					    conn,
+-					    "%s",
+-					    "websocket out of memory; closing connection");
+-					break;
+-				}
+ 			}
+ 		}
+ 
+ 		if ((header_len > 0) && (body_len >= header_len)) {
+@@ -12889,6 +12880,16 @@ read_websocket(struct mg_connection *conn,
+ 			/* Allocate space to hold websocket payload */
+ 			unsigned char *data = mem;
+ 
++			/* Automation accepts at most 1 MiB per message. Bound every
++			 * frame length encoding before allocating or reading payload. */
++			if (data_len > (uint64_t)(1024 * 1024)) {
++				const char close_code[2] = {0x03, (char)0xF1}; /* 1009 */
++				mg_websocket_write(conn,
++				                   MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
++				                   close_code, sizeof(close_code));
++				break;
++			}
++
+ 			if ((size_t)data_len > (size_t)sizeof(mem)) {
+ 				data = (unsigned char *)mg_malloc_ctx((size_t)data_len,
+ 				                                      conn->phys_ctx);

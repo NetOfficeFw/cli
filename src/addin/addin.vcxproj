@@ -60,13 +60,13 @@
     <VcpkgManifestInstall>true</VcpkgManifestInstall>
     <VcpkgUseStatic>true</VcpkgUseStatic>
     <VcpkgUseMD>true</VcpkgUseMD>
-    <VcpkgHostTriplet>x64-windows-static-md</VcpkgHostTriplet>
+    <VcpkgAutoLink>false</VcpkgAutoLink>
     <VcpkgInstalledDir>$(ProjectDir)obj\$(Platform)\vcpkg_installed\</VcpkgInstalledDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <Link>
       <ModuleDefinitionFile>$(ProjectDir)addin.def</ModuleDefinitionFile>
-      <AdditionalDependencies>Ws2_32.lib;Crypt32.lib;Secur32.lib;Bcrypt.lib;Iphlpapi.lib;Gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>civetweb.lib;Ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ImportGroup Label="ExtensionSettings">
@@ -194,20 +194,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
-    <ClInclude Include="GrpcServer.h" />
+    <ClInclude Include="HttpServer.h" />
+    <ClInclude Include="AutomationDispatcher.h" />
     <ClInclude Include="Connect.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DllMain.cpp" />
     <ClCompile Include="Connect.cpp" />
-    <ClCompile Include="GrpcServer.cpp" />
-    <ClCompile Include="$(IntDir)netoffice.pb.cc">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="$(IntDir)netoffice.grpc.pb.cc">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
+    <ClCompile Include="HttpServer.cpp" />
+    <ClCompile Include="AutomationDispatcher.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -219,16 +215,12 @@
     <None Include="Addin.def" />
     <None Include="Register-Addin.ps1" />
     <None Include="vcpkg.json" />
-    <None Include="..\proto\netoffice.proto" />
+    <None Include="vcpkg-configuration.json" />
+    <None Include="vcpkg-overlay\civetweb\vcpkg.json" />
+    <None Include="vcpkg-overlay\civetweb\portfile.cmake" />
+    <None Include="vcpkg-overlay\civetweb\limit-websocket-frame.patch" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Target Name="GenerateGrpcProtocol" BeforeTargets="ClCompile"
-          DependsOnTargets="VcpkgInstallManifestDependencies"
-          Inputs="$(ProjectDir)..\proto\netoffice.proto;$(ProjectDir)vcpkg.json;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\protobuf\protoc.exe;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\grpc\grpc_cpp_plugin.exe"
-          Outputs="$(IntDir)netoffice.pb.cc;$(IntDir)netoffice.pb.h;$(IntDir)netoffice.grpc.pb.cc;$(IntDir)netoffice.grpc.pb.h">
-    <MakeDir Directories="$(IntDir)" />
-    <Exec Command="&quot;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\protobuf\protoc.exe&quot; --proto_path=&quot;$(ProjectDir)..\proto&quot; --cpp_out=&quot;$(ProjectDir)$(IntDir).&quot; --grpc_out=&quot;$(ProjectDir)$(IntDir).&quot; --plugin=protoc-gen-grpc=&quot;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\grpc\grpc_cpp_plugin.exe&quot; &quot;$(ProjectDir)..\proto\netoffice.proto&quot;" />
-  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

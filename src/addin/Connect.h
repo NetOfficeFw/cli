@@ -3,7 +3,7 @@
 #include "pch.h"
 #include <memory>
 
-class GrpcServer;
+class HttpServer;
 
 using namespace ATL;
 
@@ -34,7 +34,7 @@ public:
 
 private:
 	void Disconnect();
-	std::shared_ptr<GrpcServer> m_pGrpcServer;
+	std::shared_ptr<HttpServer> m_pHttpServer;
 
 };
 

@@ -2,5 +2,8 @@
   "name": "netoffice-automate-addin",
   "version-string": "1.0.0",
   "builtin-baseline": "bdbcb33e2a4c7281e48aeddda70be4bc72426b47",
-  "dependencies": ["grpc", "protobuf"]
+  "dependencies": [
+    "nlohmann-json",
+    { "name": "civetweb", "default-features": false }
+  ]
 }

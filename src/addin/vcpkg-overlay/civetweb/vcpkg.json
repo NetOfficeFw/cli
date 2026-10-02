@@ -1,0 +1,12 @@
+{
+  "name": "civetweb",
+  "version": "1.16",
+  "description": "CivetWeb C library configured for loopback HTTP and WebSocket automation only.",
+  "homepage": "https://github.com/civetweb/civetweb",
+  "license": "MIT",
+  "supports": "windows & !uwp & (x86 | x64) & static",
+  "dependencies": [
+    { "name": "vcpkg-cmake", "host": true },
+    { "name": "vcpkg-cmake-config", "host": true }
+  ]
+}

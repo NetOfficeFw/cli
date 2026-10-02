@@ -1,16 +1,19 @@
 'use strict';
 
 const usage = `Usage:
-  netoffice powerpoint launch [--timeout <milliseconds>]
-  netoffice presentation new [--title <text>] [--timeout <milliseconds>]
-  netoffice slide title <text> [--slide <positive integer>] [--timeout <milliseconds>]
+  netoffice powerpoint launch [--port <port>] [--timeout <milliseconds>]
+  netoffice presentation new [--title <text>] [--port <port>] [--timeout <milliseconds>]
+  netoffice slide title <text> [--slide <positive integer>] [--port <port>] [--timeout <milliseconds>]
   netoffice --help
 
-Commands connect to the native PowerPoint add-in at 127.0.0.1:50051.
+Commands connect over WebSocket JSON to the native PowerPoint add-in on loopback.
 Launch reuses a ready PowerPoint session or starts visible PowerPoint on Windows.
 New creates one title slide in a new active presentation (default title: empty).
 Slide title updates the active presentation (default slide: 1).
+--port selects the loopback port (1..65535, default: 50051).
 --timeout sets the total operation deadline in milliseconds (default: 10000).
+Timeout or disconnect cancels queued work; an Office call already started may complete.
+Commands that change presentations are never retried.
 Use -- before positional title text starting with a dash.
 `;
 
@@ -27,7 +30,7 @@ function parseArguments(args) {
   if (!['powerpoint launch', 'presentation new', 'slide title'].includes(command)) {
     throw new Error('Expected powerpoint launch, presentation new, or slide title. Use --help for usage.');
   }
-  const result = { command, timeout: 10000, title: '', slide: 1 };
+  const result = { command, timeout: 10000, port: 50051, title: '', slide: 1 };
   const seen = new Set();
   const positionals = [];
   let literal = false;
@@ -36,7 +39,7 @@ function parseArguments(args) {
     if (!literal && arg === '--') { literal = true; continue; }
     if (!literal && (arg === '--help' || arg === '-h')) { result.help = true; continue; }
     if (!literal && arg.startsWith('-')) {
-      const allowed = arg === '--timeout' || (arg === '--title' && command === 'presentation new') || (arg === '--slide' && command === 'slide title');
+      const allowed = arg === '--timeout' || arg === '--port' || (arg === '--title' && command === 'presentation new') || (arg === '--slide' && command === 'slide title');
       if (!allowed) throw new Error(`Unknown option: ${arg}`);
       if (seen.has(arg)) throw new Error(`Repeated option: ${arg}`);
       seen.add(arg);
@@ -44,6 +47,7 @@ function parseArguments(args) {
       const value = args[index];
       if (arg === '--title') result.title = value;
       else if (arg === '--slide') result.slide = positiveInteger(value, arg, 2147483647);
+      else if (arg === '--port') result.port = positiveInteger(value, arg, 65535);
       else result.timeout = positiveInteger(value, arg, 2147483647);
     } else positionals.push(arg);
   }

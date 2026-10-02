@@ -1,15 +1,13 @@
 {
   "name": "netoffice",
   "version": "1.0.0",
-  "description": "Control the NetOffice PowerPoint native add-in over local gRPC",
+  "description": "Control the NetOffice PowerPoint native add-in over local WebSocket JSON",
   "license": "MIT",
   "type": "commonjs",
   "bin": { "netoffice": "bin/netoffice.js" },
-  "files": ["bin", "lib", "proto"],
-  "scripts": { "prepack": "node scripts/copy-proto.js" },
+  "files": ["bin", "lib"],
   "engines": { "node": ">=20" },
   "dependencies": {
-    "@grpc/grpc-js": "^1.14.0",
-    "@grpc/proto-loader": "^0.8.0"
+    "ws": "^8.18.3"
   }
 }

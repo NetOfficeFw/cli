@@ -2,11 +2,8 @@
 'use strict';
 
 const { parseArguments, usage } = require('../lib/arguments');
-const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
-
-const endpoint = '127.0.0.1:50051';
 
 // Fixed script: no command-line title or other user text is evaluated by PowerShell.
 const launchScript = `
@@ -54,51 +51,71 @@ async function main() {
   if (options.command === 'powerpoint launch' && process.platform !== 'win32') {
     throw new Error('powerpoint launch is supported only on Windows with desktop Microsoft PowerPoint installed.');
   }
-  const grpc = require('@grpc/grpc-js');
-  const protoLoader = require('@grpc/proto-loader');
-  const packagedProto = path.resolve(__dirname, '../proto/netoffice.proto');
-  const sharedProto = path.resolve(__dirname, '../../proto/netoffice.proto');
-  const protoPath = fs.existsSync(sharedProto) ? sharedProto : packagedProto;
-  const definition = protoLoader.loadSync(protoPath, { keepCase: true, defaults: true, oneofs: true });
-  const { netoffice } = grpc.loadPackageDefinition(definition);
-  const client = new netoffice.PowerPoint(endpoint, grpc.credentials.createInsecure(), { 'grpc.enable_retries': 0 });
+  const { Connection, deadlineError, retryable } = require('../lib/connection');
+  const endpoint = `ws://127.0.0.1:${options.port}/devtools/powerpoint`;
   const deadline = Date.now() + options.timeout;
-  const rpc = (method, request, end = deadline) => new Promise((resolve, reject) => {
-    client[method](request, { deadline: new Date(end) }, (error, reply) => error ? reject(error) : resolve(reply));
-  });
-  const ready = () => new Promise((resolve, reject) => {
-    client.waitForReady(new Date(deadline), error => error ? reject(error) : resolve());
-  });
+  let client;
+  const connect = async end => {
+    client = await Connection.connect(endpoint, end);
+  };
+  const status = async end => {
+    const reply = await client.request('PowerPoint.getStatus', {}, end);
+    if (!Number.isSafeInteger(reply.processId) || reply.processId < 1) throw new Error('Invalid server response: expected a positive processId.');
+    return reply;
+  };
+  const ready = async requireStatus => {
+    while (Date.now() < deadline) {
+      const attemptDeadline = Math.min(deadline, Date.now() + 500);
+      try {
+        await connect(attemptDeadline);
+        return requireStatus ? await status(attemptDeadline) : undefined;
+      } catch (error) {
+        if (client) { client.close(); client = undefined; }
+        if (!retryable(error)) throw error;
+        const remaining = deadline - Date.now();
+        if (remaining > 0) await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining)));
+      }
+    }
+    throw deadlineError();
+  };
   try {
     if (options.command === 'powerpoint launch') {
-      let status;
+      let reply;
+      const probeDeadline = Math.min(deadline, Date.now() + 500);
       try {
-        status = await rpc('getStatus', {}, Math.min(deadline, Date.now() + 500));
+        await connect(probeDeadline);
+        reply = await status(probeDeadline);
       } catch (error) {
-        if (![grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED].includes(error.code)) throw error;
-        if (Date.now() >= deadline) throw error;
+        if (client) { client.close(); client = undefined; }
+        if (!retryable(error)) throw error;
+        if (Date.now() >= deadline) throw deadlineError();
         await launchPowerPoint(deadline);
-        await ready();
-        status = await rpc('getStatus', {});
+        reply = await ready(true);
       }
-      console.log(`PowerPoint ready (PID ${status.process_id}).`);
+      console.log(`PowerPoint ready (PID ${reply.processId}).`);
     } else {
-      await ready();
+      await ready(false);
       if (options.command === 'presentation new') {
-        const reply = await rpc('newPresentation', { title: options.title });
-        console.log(`Created presentation ${JSON.stringify(reply.name)} (${reply.slide_count} slide${reply.slide_count === 1 ? '' : 's'}).`);
+        const reply = await client.request('PowerPoint.newPresentation', { title: options.title }, deadline);
+        if (typeof reply.name !== 'string' || !Number.isSafeInteger(reply.slideCount) || reply.slideCount < 0) {
+          throw new Error('Invalid server response: expected presentation name and slideCount. The presentation may already have been created; the command was not retried.');
+        }
+        console.log(`Created presentation ${JSON.stringify(reply.name)} (${reply.slideCount} slide${reply.slideCount === 1 ? '' : 's'}).`);
       } else {
-        await rpc('setSlideTitle', { slide_index: options.slide, text: options.title });
+        await client.request('PowerPoint.setSlideTitle', { slideIndex: options.slide, text: options.title }, deadline);
         console.log(`Updated slide ${options.slide} title to ${JSON.stringify(options.title)}.`);
       }
     }
   } catch (error) {
-    const status = Object.keys(grpc.status).find(name => grpc.status[name] === error.code);
-    const unavailable = error.code === grpc.status.UNAVAILABLE || error.code === grpc.status.DEADLINE_EXCEEDED || (!Number.isInteger(error.code) && Date.now() >= deadline);
-    const detail = error.details || error.message;
-    throw new Error(`${status ? `${status}: ` : ''}${detail}${unavailable ? '\nEnsure PowerPoint is running and the NetOffice native add-in is registered, enabled, and listening at ' + endpoint + '. Use netoffice powerpoint launch on Windows or increase --timeout.' : ''}`);
+    const code = Number.isInteger(error.code) ? `Error ${error.code}: ` : '';
+    const data = Object.hasOwn(error, 'data') ? `\nDetails: ${JSON.stringify(error.data)}` : '';
+    const unavailable = retryable(error) || Date.now() >= deadline;
+    const cancellation = error.code === -32002 || error.code === -32003
+      ? '\nQueued work is cancelled; an Office call already started may complete. Do not blindly retry a command that changes a presentation.'
+      : '';
+    throw new Error(`${code}${error.message}${data}${cancellation}${unavailable ? '\nEnsure PowerPoint is running and the NetOffice native add-in is registered, enabled, and listening at ' + endpoint + '. --port must match the registered ServerPort; launch does not reconfigure the add-in. Use netoffice powerpoint launch on Windows or increase --timeout.' : ''}`);
   } finally {
-    client.close();
+    if (client) client.close();
   }
 }
 

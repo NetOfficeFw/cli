@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package netoffice;
+
+service PowerPoint {
+  rpc GetStatus(Empty) returns (StatusReply);
+  rpc NewPresentation(NewPresentationRequest) returns (PresentationReply);
+  rpc SetSlideTitle(SetSlideTitleRequest) returns (Empty);
+}
+
+message Empty {}
+
+message StatusReply {
+  uint32 process_id = 1;
+}
+
+message NewPresentationRequest {
+  string title = 1;
+}
+
+// A new presentation contains one title slide and becomes active.
+message PresentationReply {
+  string name = 1;
+  int32 slide_count = 2;
+}
+
+// Addresses the active presentation, using PowerPoint's one-based slide index.
+message SetSlideTitleRequest {
+  int32 slide_index = 1;
+  string text = 2;
+}

@@ -21,6 +21,13 @@ x86/
 bld/
 [Bb]in/
 [Oo]bj/
+!/src/cli/bin/
+!/src/cli/bin/netoffice.js
 
 # Visual Studio cache
 .vs/
+
+# Node dependencies and packed CLI artifacts
+node_modules/
+*.tgz
+/src/cli/proto/

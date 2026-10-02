@@ -1,6 +1,9 @@
 #pragma once
 
 #include "pch.h"
+#include <memory>
+
+class GrpcServer;
 
 using namespace ATL;
 
@@ -27,9 +30,12 @@ public:
 	STDMETHOD(OnAddInsUpdate)(SAFEARRAY **custom);
 	STDMETHOD(OnStartupComplete)(SAFEARRAY **custom);
 	STDMETHOD(OnBeginShutdown)(SAFEARRAY **custom);
+	void FinalRelease();
 
-	CComPtr<IDispatch> m_pApplication;
-	CComPtr<IDispatch> m_pAddInInstance;
+private:
+	void Disconnect();
+	std::shared_ptr<GrpcServer> m_pGrpcServer;
+
 };
 
 OBJECT_ENTRY_AUTO(__uuidof(NetOfficeAutomateLibraryGuid), CConnect)

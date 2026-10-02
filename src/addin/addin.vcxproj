@@ -24,6 +24,7 @@
     <ProjectGuid>{02c44285-590c-42f5-85e7-50710eef1ae5}</ProjectGuid>
     <RootNamespace>addin</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -55,10 +56,17 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
     <OfficeExtensibilityDir Condition="'$(OfficeExtensibilityDir)'==''">$(MSBuildProgramFiles32)\Microsoft Office\root\vfs\ProgramFilesCommonX86\DESIGNER</OfficeExtensibilityDir>
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgManifestInstall>true</VcpkgManifestInstall>
+    <VcpkgUseStatic>true</VcpkgUseStatic>
+    <VcpkgUseMD>true</VcpkgUseMD>
+    <VcpkgHostTriplet>x64-windows-static-md</VcpkgHostTriplet>
+    <VcpkgInstalledDir>$(ProjectDir)obj\$(Platform)\vcpkg_installed\</VcpkgInstalledDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <Link>
       <ModuleDefinitionFile>$(ProjectDir)addin.def</ModuleDefinitionFile>
+      <AdditionalDependencies>Ws2_32.lib;Crypt32.lib;Secur32.lib;Bcrypt.lib;Iphlpapi.lib;Gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ImportGroup Label="ExtensionSettings">
@@ -97,6 +105,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalIncludeDirectories>$(ProjectDir)$(IntDir);$(OfficeExtensibilityDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -185,12 +194,20 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="GrpcServer.h" />
     <ClInclude Include="Connect.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DllMain.cpp" />
     <ClCompile Include="Connect.cpp" />
+    <ClCompile Include="GrpcServer.cpp" />
+    <ClCompile Include="$(IntDir)netoffice.pb.cc">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)netoffice.grpc.pb.cc">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -201,8 +218,17 @@
   <ItemGroup>
     <None Include="Addin.def" />
     <None Include="Register-Addin.ps1" />
+    <None Include="vcpkg.json" />
+    <None Include="..\proto\netoffice.proto" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="GenerateGrpcProtocol" BeforeTargets="ClCompile"
+          DependsOnTargets="VcpkgInstallManifestDependencies"
+          Inputs="$(ProjectDir)..\proto\netoffice.proto;$(ProjectDir)vcpkg.json;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\protobuf\protoc.exe;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\grpc\grpc_cpp_plugin.exe"
+          Outputs="$(IntDir)netoffice.pb.cc;$(IntDir)netoffice.pb.h;$(IntDir)netoffice.grpc.pb.cc;$(IntDir)netoffice.grpc.pb.h">
+    <MakeDir Directories="$(IntDir)" />
+    <Exec Command="&quot;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\protobuf\protoc.exe&quot; --proto_path=&quot;$(ProjectDir)..\proto&quot; --cpp_out=&quot;$(ProjectDir)$(IntDir).&quot; --grpc_out=&quot;$(ProjectDir)$(IntDir).&quot; --plugin=protoc-gen-grpc=&quot;$(VcpkgInstalledDir)$(VcpkgHostTriplet)\tools\grpc\grpc_cpp_plugin.exe&quot; &quot;$(ProjectDir)..\proto\netoffice.proto&quot;" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

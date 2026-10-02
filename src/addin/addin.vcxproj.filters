@@ -24,12 +24,24 @@
     <ClInclude Include="Connect.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="GrpcServer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="dllmain.cpp">
+    <ClCompile Include="DllMain.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Connect.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="GrpcServer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)netoffice.pb.cc">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)netoffice.grpc.pb.cc">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="pch.cpp">
@@ -37,9 +49,11 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="addin.def">
+    <None Include="Addin.def">
       <Filter>Source Files</Filter>
     </None>
     <None Include="Register-Addin.ps1" />
+    <None Include="vcpkg.json" />
+    <None Include="..\proto\netoffice.proto" />
   </ItemGroup>
 </Project>

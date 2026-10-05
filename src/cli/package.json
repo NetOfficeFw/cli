@@ -7,6 +7,9 @@
   "bin": { "netoffice": "bin/netoffice.js" },
   "files": ["bin", "lib"],
   "engines": { "node": ">=20" },
+  "scripts": {
+    "test:state-api": "node --test test/state-api.test.js"
+  },
   "dependencies": {
     "ws": "^8.18.3"
   }

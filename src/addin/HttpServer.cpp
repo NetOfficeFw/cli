@@ -5,6 +5,7 @@
 #include <civetweb.h>
 #include <nlohmann/json.hpp>
 
+#include <climits>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -111,7 +112,11 @@ namespace
 		return Json{{"error", {{"code", code}, {"message", message}}}};
 	}
 
-	enum class Endpoint { Unknown, Rpc, WebSocket, Version, List, New, Activate, Close };
+	enum class Endpoint
+	{
+		Unknown, Rpc, WebSocket, Version, List, New, Activate, Close,
+		Presentation, Slides, Slide, View, SlideShow
+	};
 
 	std::string_view RequestPath(const mg_request_info &request)
 	{
@@ -120,6 +125,8 @@ namespace
 		return request.local_uri_raw == nullptr ? std::string_view() : request.local_uri_raw;
 	}
 
+	bool IdentifyPresentationEndpoint(std::string_view path, Endpoint &endpoint,
+		std::string *target, long &slideId);
 	Endpoint IdentifyEndpoint(std::string_view path)
 	{
 		if (path == "/json/rpc") return Endpoint::Rpc;
@@ -129,7 +136,67 @@ namespace
 		if (path == "/json/new") return Endpoint::New;
 		if (path == "/json/activate" || path.substr(0, 15) == "/json/activate/") return Endpoint::Activate;
 		if (path == "/json/close" || path.substr(0, 12) == "/json/close/") return Endpoint::Close;
+		Endpoint stateEndpoint = Endpoint::Unknown;
+		long slideId = 0;
+		if (IdentifyPresentationEndpoint(path, stateEndpoint, nullptr, slideId))
+			return stateEndpoint;
 		return Endpoint::Unknown;
+	}
+	bool IdentifyPresentationEndpoint(std::string_view path, Endpoint &endpoint,
+		std::string *target, long &slideId)
+	{
+		constexpr std::string_view prefix = "/json/";
+		if (path.substr(0, prefix.size()) != prefix)
+			return false;
+		path.remove_prefix(prefix.size());
+		size_t separator = path.find('/');
+		std::string_view targetView = path.substr(0, separator);
+		if (targetView.empty() || separator == std::string_view::npos)
+			return false;
+		if (target != nullptr)
+			target->assign(targetView);
+		path.remove_prefix(separator + 1);
+		if (path == "presentation")
+		{
+			endpoint = Endpoint::Presentation;
+			return true;
+		}
+		if (path == "slides")
+		{
+			endpoint = Endpoint::Slides;
+			return true;
+		}
+		if (path.substr(0, 7) == "slides/")
+		{
+			endpoint = Endpoint::Slide;
+			std::string_view value = path.substr(7);
+			if (value.empty())
+				return true;
+			unsigned long parsed = 0;
+			for (char digit : value)
+			{
+				if (digit < '0' || digit > '9' || parsed > (static_cast<unsigned long>(INT_MAX) -
+					static_cast<unsigned long>(digit - '0')) / 10)
+					return true;
+				parsed = parsed * 10 + static_cast<unsigned long>(digit - '0');
+			}
+			if (parsed > 0)
+				slideId = static_cast<long>(parsed);
+			else
+				slideId = 0;
+			return true;
+		}
+		if (path == "view")
+		{
+			endpoint = Endpoint::View;
+			return true;
+		}
+		if (path == "slide-show")
+		{
+			endpoint = Endpoint::SlideShow;
+			return true;
+		}
+		return false;
 	}
 
 	const char *EndpointMethod(Endpoint endpoint)
@@ -572,7 +639,12 @@ struct HttpServer::State
 	{
 		const auto &request = *mg_get_request_info(connection);
 		std::string_view path = RequestPath(request);
-		const Endpoint endpoint = IdentifyEndpoint(path);
+		std::string target;
+		long slideId = 0;
+		Endpoint endpoint = Endpoint::Unknown;
+		const bool stateRoute = IdentifyPresentationEndpoint(path, endpoint, &target, slideId);
+		if (!stateRoute)
+			endpoint = IdentifyEndpoint(path);
 		if (endpoint == Endpoint::Rpc)
 		{
 			auto session = Find(connection);
@@ -611,20 +683,36 @@ struct HttpServer::State
 		if (!ParseHttpQuery(request.query_string, argument, force, queryError))
 			return SendHttp(connection, 400, HttpErrorReply(-32602, queryError).dump());
 		AutomationDispatcher::HttpCommand command;
-		switch (endpoint)
+		if (stateRoute)
 		{
-		case Endpoint::Version: command = AutomationDispatcher::HttpCommand::Version; argument.clear(); break;
-		case Endpoint::List: command = AutomationDispatcher::HttpCommand::List; argument.clear(); break;
-		case Endpoint::New: command = AutomationDispatcher::HttpCommand::New; break;
-		case Endpoint::Activate:
-			command = AutomationDispatcher::HttpCommand::Activate;
-			argument = path.size() > 15 ? std::string(path.substr(15)) : "";
-			break;
-		case Endpoint::Close:
-			command = AutomationDispatcher::HttpCommand::Close;
-			argument = path.size() > 12 ? std::string(path.substr(12)) : "";
-			break;
-		default: return ProtocolError(connection, 404, "Unknown endpoint");
+			argument = std::move(target);
+			switch (endpoint)
+			{
+			case Endpoint::Presentation: command = AutomationDispatcher::HttpCommand::Presentation; break;
+			case Endpoint::Slides: command = AutomationDispatcher::HttpCommand::Slides; break;
+			case Endpoint::Slide: command = AutomationDispatcher::HttpCommand::Slide; break;
+			case Endpoint::View: command = AutomationDispatcher::HttpCommand::View; break;
+			case Endpoint::SlideShow: command = AutomationDispatcher::HttpCommand::SlideShow; break;
+			default: return ProtocolError(connection, 404, "Unknown endpoint");
+			}
+		}
+		else
+		{
+			switch (endpoint)
+			{
+			case Endpoint::Version: command = AutomationDispatcher::HttpCommand::Version; argument.clear(); break;
+			case Endpoint::List: command = AutomationDispatcher::HttpCommand::List; argument.clear(); break;
+			case Endpoint::New: command = AutomationDispatcher::HttpCommand::New; break;
+			case Endpoint::Activate:
+				command = AutomationDispatcher::HttpCommand::Activate;
+				argument = path.size() > 15 ? std::string(path.substr(15)) : "";
+				break;
+			case Endpoint::Close:
+				command = AutomationDispatcher::HttpCommand::Close;
+				argument = path.size() > 12 ? std::string(path.substr(12)) : "";
+				break;
+			default: return ProtocolError(connection, 404, "Unknown endpoint");
+			}
 		}
 		if ((endpoint == Endpoint::Activate || endpoint == Endpoint::Close) && !argument.empty())
 		{
@@ -638,7 +726,8 @@ struct HttpServer::State
 			if (argument.find('\0') != std::string::npos)
 				return SendHttp(connection, 400, HttpErrorReply(-32602, "Target must not contain a NUL character").dump());
 		}
-		Json envelope = dispatcher->HandleHttpRequest(command, argument, endpoint == Endpoint::Close && force, session->cancelled);
+		Json envelope = dispatcher->HandleHttpRequest(command, argument, slideId,
+			endpoint == Endpoint::Close && force, session->cancelled);
 		if (session->cancelled->load())
 			return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
 		int status = 200;

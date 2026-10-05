@@ -127,6 +127,11 @@ there is no `jsonrpc` member.
 | `PUT /json/activate/{target}` | Activate the document and bring its window to the foreground |
 | `PUT /json/close/{target}` | Close a saved document; HTTP 409 when it has unsaved changes |
 | `PUT /json/close/{target}?force` | Discard changes and close the document without saving |
+| `GET /json/{target}/presentation` | Targeted presentation name/path, saved state, read-only state, and slide count |
+| `GET /json/{target}/slides` | Ordered slides with stable slide IDs, indices, names, and hidden state |
+| `GET /json/{target}/slides/{slide-id}` | Slide metadata and shape IDs, z-order, type, bounds, and readable plain text |
+| `GET /json/{target}/view` | Editing-window view and selection state, when available |
+| `GET /json/{target}/slide-show` | Running slide-show windows and each current slide |
 | `POST /json/rpc` | One JSON request and response; requires `Content-Type: application/json` |
 | `WS /devtools/application` | Application-wide UTF-8 JSON requests and correlated responses |
 
@@ -208,6 +213,39 @@ Errors are JSON `{"error":{"code":...,"message":...,"data":...}}`, with optional
 HRESULT details. HTTP target requests have a 10-second queue deadline; a started
 Office call may outlive it. Inspect the document list before repeating a mutation.
 
+### Reading presentation state
+
+The new read routes are target-scoped; `{target}` is the opaque ID from `/json/list`.
+Slide routes use PowerPoint's stable `SlideID`, not the current slide index.
+Responses use camelCase JSON fields. Slide details contain top-level shape
+summaries (`shapeId`, `zOrderPosition`, `name`, numeric `shapeType`, `bounds`,
+and plain `text` or `null`). Rich text, recursive groups, charts, and image
+contents are not represented. View/selection fields are transient and may be
+unavailable. `slide-show` reports live show windows and their current slides.
+Each call is a best-effort COM read, not a transactionally consistent snapshot.
+
+```powershell
+$base = 'http://127.0.0.1:50051'
+$target = 'd17fd90d-90f8-4a29-b204-49495b78d064'
+$presentation = Invoke-RestMethod "$base/json/$target/presentation"
+$slides = Invoke-RestMethod "$base/json/$target/slides"
+$slideId = $slides.slides[0].slideId
+$slide = Invoke-RestMethod "$base/json/$target/slides/$slideId"
+$view = Invoke-RestMethod "$base/json/$target/view"
+$show = Invoke-RestMethod "$base/json/$target/slide-show"
+```
+
+Matching application WebSocket methods are `PowerPoint.getPresentationState`,
+`PowerPoint.getSlides`, `PowerPoint.getSlideState`, `PowerPoint.getViewState`,
+and `PowerPoint.getSlideShowState`. Pass `{ "targetId": "<target>" }`; the
+slide-detail method also requires `slideId`. HTTP and WebSocket return the same
+result shape. Unknown targets or slide IDs fail rather than falling back to the
+active presentation. These methods are not exposed as Node CLI commands.
+
+See [`docs/powerpoint-state-api.md`](docs/powerpoint-state-api.md) for full
+response examples, enum notes, and COM state caveats.
+
+
 ### Application WebSocket commands
 
 
@@ -220,6 +258,21 @@ Office call may outlive it. Inspect the document list before repeating a mutatio
 
 {"id":3,"method":"PowerPoint.setSlideTitle","params":{"slideIndex":1,"text":"Updated title"}}
 {"id":3,"result":{}}
+{"id":5,"method":"PowerPoint.getPresentationState","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064"}}
+{"id":5,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","name":"Quarterly report.pptx","url":"C:\\Documents\\Quarterly report.pptx","saved":true,"readOnly":false,"slideCount":1}}
+
+{"id":6,"method":"PowerPoint.getSlides","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064"}}
+{"id":6,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","slides":[{"slideId":259,"slideIndex":1,"name":"Agenda","hidden":false}]}}
+
+{"id":7,"method":"PowerPoint.getSlideState","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064","slideId":259}}
+{"id":7,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","slide":{"slideId":259,"slideIndex":1,"name":"Agenda","hidden":false,"shapes":[{"shapeId":7,"zOrderPosition":1,"name":"Title 1","shapeType":14,"placeholderType":1,"text":"Agenda","bounds":{"left":36.0,"top":24.0,"width":648.0,"height":54.0}}]}}}
+
+{"id":8,"method":"PowerPoint.getViewState","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064"}}
+{"id":8,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","available":true,"windows":[{"viewType":1,"currentSlideId":259,"currentSlideIndex":1,"selection":{"type":0}}]}}
+
+{"id":9,"method":"PowerPoint.getSlideShowState","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064"}}
+{"id":9,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","running":false,"windows":[]}}
+
 
 {"id":4,"method":"PowerPoint.unknown"}
 {"id":4,"error":{"code":-32601,"message":"Unknown PowerPoint method"}}
@@ -230,6 +283,7 @@ must be an object. `newPresentation` accepts an optional string `title`;
 `setSlideTitle` requires a positive int32 `slideIndex` and string `text`.
 `timeoutMs` is an optional positive int32, default `10000`. Responses retain
 the request ID; malformed JSON or an invalid ID produces `id: null`.
+The state methods require a canonical `targetId`; `getSlideState` also requires a positive int32 `slideId`. Invalid parameters return `-32602`; unknown targets or slide IDs return `-32004`.
 
 | Error code | Meaning |
 | --- | --- |
@@ -241,11 +295,25 @@ the request ID; malformed JSON or an invalid ID produces `id: null`.
 | `-32001` | No active presentation or title placeholder |
 | `-32002` | Request deadline expired |
 | `-32003` | Connection cancelled or addin stopping |
+| `-32004` | Unknown or closed document target, or slide ID not found in that presentation |
 
 Use WebSocket for disconnect-sensitive mutations. CivetWeb's released server
 API cannot detect an HTTP client's disconnect while its handler waits for
 the STA, so an abandoned POST or PUT may still execute until its queue deadline.
 Server shutdown cancels queued work on both transports.
+
+### Integration test
+
+On Windows, with the native add-in built and registered and the CLI dependencies
+installed, run the live PowerPoint state-read integration test:
+
+```powershell
+npm --prefix src/cli run test:state-api
+```
+
+The test launches or reuses PowerPoint, creates two unsaved test presentations,
+checks each read over HTTP and WebSocket, then discards both test documents.
+Set `NETOFFICE_PORT` if the registered add-in uses a non-default port.
 
 The endpoint is plaintext and unauthenticated, bound only to `127.0.0.1`.
 No wildcard CORS headers are sent. Requests with an `Origin` must use exactly

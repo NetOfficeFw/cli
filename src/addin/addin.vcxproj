@@ -196,6 +196,7 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="HttpServer.h" />
     <ClInclude Include="AutomationDispatcher.h" />
+    <ClInclude Include="PowerPointCommands.h" />
     <ClInclude Include="Connect.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
@@ -204,6 +205,13 @@
     <ClCompile Include="Connect.cpp" />
     <ClCompile Include="HttpServer.cpp" />
     <ClCompile Include="AutomationDispatcher.cpp" />
+    <ClCompile Include="CommandRuntime.cpp" />
+    <ClCompile Include="PresentationCommands.cpp" />
+    <ClCompile Include="SlideCommands.cpp" />
+    <ClCompile Include="ShapeFormatCommands.cpp" />
+    <ClCompile Include="TextCommands.cpp" />
+    <ClCompile Include="ContentCommands.cpp" />
+    <ClCompile Include="DataCommands.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>

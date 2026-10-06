@@ -2,11 +2,12 @@
 #include "AutomationDispatcher.h"
 
 #include <algorithm>
-#include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cwchar>
 #include <exception>
+#include <filesystem>
 #include <new>
 #include <utility>
 #include <vector>
@@ -53,49 +54,6 @@ namespace
 			static_cast<uint64_t>(number) <= maximum;
 	}
 
-	HRESULT Utf8ToVariant(const std::string &text, ATL::CComVariant &result)
-	{
-		if (text.size() > INT_MAX)
-			return E_INVALIDARG;
-		int length = 0;
-		if (!text.empty())
-		{
-			length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-				text.data(), static_cast<int>(text.size()), nullptr, 0);
-			if (length == 0)
-				return HRESULT_FROM_WIN32(GetLastError());
-		}
-		result.bstrVal = SysAllocStringLen(nullptr, length);
-		if (result.bstrVal == nullptr)
-			return E_OUTOFMEMORY;
-		result.vt = VT_BSTR;
-		if (length != 0 && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-			text.data(), static_cast<int>(text.size()), result.bstrVal, length) != length)
-			return HRESULT_FROM_WIN32(GetLastError());
-		return S_OK;
-	}
-
-	HRESULT BstrToUtf8(BSTR text, std::string &result)
-	{
-		UINT length = SysStringLen(text);
-		if (length > INT_MAX)
-			return E_INVALIDARG;
-		if (length == 0)
-		{
-			result.clear();
-			return S_OK;
-		}
-		int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-			text, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
-		if (bytes == 0)
-			return HRESULT_FROM_WIN32(GetLastError());
-		result.resize(bytes);
-		if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text,
-			static_cast<int>(length), result.data(), bytes, nullptr, nullptr) != bytes)
-			return HRESULT_FROM_WIN32(GetLastError());
-		return S_OK;
-	}
-
 	std::string MemberName(const wchar_t *name)
 	{
 		// These Automation member names are ASCII; user text uses checked UTF-8.
@@ -104,6 +62,50 @@ namespace
 			result.push_back(static_cast<char>(*name++));
 		return result;
 	}
+}
+
+HRESULT AutomationDispatcher::Utf8ToVariant(const std::string &text, ATL::CComVariant &result)
+{
+	if (text.size() > INT_MAX)
+		return E_INVALIDARG;
+	int length = 0;
+	if (!text.empty())
+	{
+		length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+			text.data(), static_cast<int>(text.size()), nullptr, 0);
+		if (length == 0)
+			return HRESULT_FROM_WIN32(GetLastError());
+	}
+	result.Clear();
+	result.bstrVal = SysAllocStringLen(nullptr, length);
+	if (result.bstrVal == nullptr)
+		return E_OUTOFMEMORY;
+	result.vt = VT_BSTR;
+	if (length != 0 && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+		text.data(), static_cast<int>(text.size()), result.bstrVal, length) != length)
+		return HRESULT_FROM_WIN32(GetLastError());
+	return S_OK;
+}
+
+HRESULT AutomationDispatcher::BstrToUtf8(BSTR text, std::string &result)
+{
+	UINT length = SysStringLen(text);
+	if (length > INT_MAX)
+		return E_INVALIDARG;
+	if (length == 0)
+	{
+		result.clear();
+		return S_OK;
+	}
+	int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+		text, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+	if (bytes == 0)
+		return HRESULT_FROM_WIN32(GetLastError());
+	result.resize(bytes);
+	if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text,
+		static_cast<int>(length), result.data(), bytes, nullptr, nullptr) != bytes)
+		return HRESULT_FROM_WIN32(GetLastError());
+	return S_OK;
 }
 
 AutomationDispatcher::Status AutomationDispatcher::ErrorStatus(int code, HRESULT hr,
@@ -147,13 +149,17 @@ nlohmann::json AutomationDispatcher::ErrorReply(const nlohmann::json &id, const 
 
 struct AutomationDispatcher::PendingCall
 {
-	enum class Operation { GetStatus, NewPresentation, SetSlideTitle, Http };
+	enum class Operation { GetStatus, NewPresentation, PrepareShutdown, Http };
 	explicit PendingCall(Operation operation) : operation(operation) {}
 
 	Operation operation;
 	std::string text;
-	int slideIndex = 0;
+	std::string name;
+	std::string directory;
+	long slideId = 0;
+	long shapeId = 0;
 	HttpCommand httpCommand = HttpCommand::Version;
+	nlohmann::json parameters = nlohmann::json::object();
 	bool force = false;
 	nlohmann::json result;
 	std::shared_ptr<std::atomic_bool> cancelled;
@@ -299,34 +305,157 @@ nlohmann::json AutomationDispatcher::HandleRequest(const nlohmann::json &request
 		}
 		const auto &method = request["method"].get_ref<const std::string &>();
 		PendingCall::Operation operation;
+		HttpCommand httpCommand = HttpCommand::Version;
 		if (method == "PowerPoint.getStatus")
 			operation = PendingCall::Operation::GetStatus;
 		else if (method == "PowerPoint.newPresentation")
 			operation = PendingCall::Operation::NewPresentation;
-		else if (method == "PowerPoint.setSlideTitle")
-			operation = PendingCall::Operation::SetSlideTitle;
+		else if (method == "PowerPoint.prepareShutdown")
+			operation = PendingCall::Operation::PrepareShutdown;
 		else
-			return invalid(-32601, "Unknown PowerPoint method");
+		{
+			operation = PendingCall::Operation::Http;
+			if (method == "PowerPoint.getPresentationState") httpCommand = HttpCommand::Presentation;
+			else if (method == "PowerPoint.openPresentation") httpCommand = HttpCommand::New;
+			else if (method == "PowerPoint.closePresentation") httpCommand = HttpCommand::Close;
+			else if (method == "PowerPoint.getSlides") httpCommand = HttpCommand::Slides;
+			else if (method == "PowerPoint.getSlideState") httpCommand = HttpCommand::Slide;
+			else if (method == "PowerPoint.getViewState") httpCommand = HttpCommand::View;
+			else if (method == "PowerPoint.getSlideShowState") httpCommand = HttpCommand::SlideShow;
+			else if (method == "PowerPoint.addSlide") httpCommand = HttpCommand::AddSlide;
+			else if (method == "PowerPoint.createShape") httpCommand = HttpCommand::AddShape;
+			else if (method == "PowerPoint.setShapeText") httpCommand = HttpCommand::SetShapeText;
+			else if (method == "PowerPoint.deleteShape") httpCommand = HttpCommand::DeleteShape;
+			else if (method == "PowerPoint.deleteSlide") httpCommand = HttpCommand::DeleteSlide;
+			else if (method == "PowerPoint.setCurrentSlide") httpCommand = HttpCommand::SetCurrentSlide;
+			else if (method == "PowerPoint.startSlideShow") httpCommand = HttpCommand::StartSlideShow;
+			else if (method == "PowerPoint.stopSlideShow") httpCommand = HttpCommand::StopSlideShow;
+			else if (method == "PowerPoint.navigateSlideShow") httpCommand = HttpCommand::NavigateSlideShow;
+			else if (const CommandInfo *info = FindCommand(method)) httpCommand = info->command;
+			else return invalid(-32601, "Unknown PowerPoint method");
+		}
 
 		static const nlohmann::json emptyParams = nlohmann::json::object();
 		const auto &params = request.contains("params") ? request["params"] : emptyParams;
-		if (operation == PendingCall::Operation::NewPresentation && params.contains("title") &&
-			!params["title"].is_string())
-			return invalid(-32602, "title must be a string");
-		if (operation == PendingCall::Operation::SetSlideTitle &&
-			(!params.contains("slideIndex") || !IntegerInRange(params["slideIndex"], 1, INT_MAX) ||
-			 !params.contains("text") || !params["text"].is_string()))
-			return invalid(-32602, "setSlideTitle requires a positive int32 slideIndex and string text");
-
+		if (operation == PendingCall::Operation::NewPresentation &&
+			(!params.contains("name") || !params["name"].is_string() ||
+			 params["name"].get_ref<const std::string &>().empty() ||
+			 !params.contains("directory") || !params["directory"].is_string() ||
+			 params["directory"].get_ref<const std::string &>().empty()))
+			return invalid(-32602, "newPresentation requires a non-empty name and absolute directory");
+		if (operation == PendingCall::Operation::PrepareShutdown &&
+			params.contains("force") && !params["force"].is_boolean())
+			return invalid(-32602, "prepareShutdown force must be a boolean");
+		if (operation == PendingCall::Operation::Http && httpCommand == HttpCommand::New &&
+			(!params.contains("path") || !params["path"].is_string() ||
+			 params["path"].get_ref<const std::string &>().empty() ||
+			 params["path"].get_ref<const std::string &>().size() > MaximumHttpArgumentBytes ||
+			 params["path"].get_ref<const std::string &>().find('\0') != std::string::npos))
+			return invalid(-32602, "openPresentation requires a non-empty path without null characters (at most 1 MiB)");
+		if (operation == PendingCall::Operation::Http)
+		{
+			const CommandInfo *info = FindCommand(httpCommand);
+			const bool application = info != nullptr && info->scope == CommandScope::Application;
+			if (httpCommand != HttpCommand::New && !application &&
+				(!params.contains("targetId") || !params["targetId"].is_string() ||
+				 !IsTargetId(params["targetId"].get<std::string>())))
+				return invalid(-32602, "PowerPoint methods require a canonical GUID targetId");
+			const bool masterAllowed = (info != nullptr && (info->scope == CommandScope::Container ||
+				info->scope == CommandScope::Shape)) || httpCommand == HttpCommand::AddShape ||
+				httpCommand == HttpCommand::SetShapeText || httpCommand == HttpCommand::DeleteShape;
+			if (params.contains("master") && !params["master"].is_boolean())
+				return invalid(-32602, "master must be a boolean");
+			const bool master = params.value("master", false);
+			if (master && !masterAllowed)
+				return invalid(-32602, "Method does not accept master");
+			// customLayout selects a layout container, except on addSlide where it picks the new slide's layout.
+			const bool layoutContainer = httpCommand != HttpCommand::AddSlide && params.contains("customLayout");
+			if (layoutContainer && (!masterAllowed || !IntegerInRange(params["customLayout"], 1, INT_MAX)))
+				return invalid(-32602, "customLayout must be a positive layout index on slide, master, or layout commands");
+			if (static_cast<int>(master) + static_cast<int>(layoutContainer) +
+				static_cast<int>(params.contains("slideId") && masterAllowed) > 1)
+				return invalid(-32602, "slideId, master, and customLayout are mutually exclusive");
+			if (httpCommand == HttpCommand::Close && params.contains("force") &&
+				!params["force"].is_boolean())
+				return invalid(-32602, "closePresentation force must be a boolean");
+			bool navigationGoto = false;
+			if (httpCommand == HttpCommand::NavigateSlideShow)
+			{
+				if (!params.contains("action") || !params["action"].is_string() ||
+					(params["action"] != "next" && params["action"] != "previous" &&
+					 params["action"] != "goto"))
+					return invalid(-32602, "navigateSlideShow action must be next, previous, or goto");
+				navigationGoto = params["action"] == "goto";
+			}
+			const bool needsSlide = !master && !layoutContainer && (httpCommand == HttpCommand::Slide ||
+				httpCommand == HttpCommand::AddShape || httpCommand == HttpCommand::SetShapeText ||
+				httpCommand == HttpCommand::DeleteShape || httpCommand == HttpCommand::DeleteSlide ||
+				httpCommand == HttpCommand::SetCurrentSlide || navigationGoto ||
+				(info != nullptr && (info->scope == CommandScope::Slide ||
+				 info->scope == CommandScope::Container || info->scope == CommandScope::Shape)));
+			if (needsSlide && (!params.contains("slideId") ||
+				!IntegerInRange(params["slideId"], 1, INT_MAX)))
+				return invalid(-32602, "Method requires a positive int32 slideId, master, or customLayout");
+			const bool needsShape = httpCommand == HttpCommand::SetShapeText ||
+				httpCommand == HttpCommand::DeleteShape ||
+				(info != nullptr && info->scope == CommandScope::Shape);
+			if (needsShape && (!params.contains("shapeId") ||
+				!IntegerInRange(params["shapeId"], 1, INT_MAX)))
+				return invalid(-32602, "Method requires a positive int32 shapeId");
+			if (httpCommand == HttpCommand::SetShapeText &&
+				(!params.contains("text") || !params["text"].is_string()))
+				return invalid(-32602, "setShapeText requires string text");
+			if (httpCommand == HttpCommand::AddSlide && params.contains("layout") &&
+				!IntegerInRange(params["layout"], 1, 12))
+				return invalid(-32602, "layout must be a PowerPoint slide layout from 1 through 12");
+			if (httpCommand == HttpCommand::AddSlide &&
+				static_cast<int>(params.contains("layout")) + static_cast<int>(params.contains("customLayout")) +
+				static_cast<int>(params.contains("customLayoutName")) > 1)
+				return invalid(-32602, "addSlide accepts only one of layout, customLayout, or customLayoutName");
+			if (httpCommand == HttpCommand::AddSlide && params.contains("customLayout") &&
+				!IntegerInRange(params["customLayout"], 1, INT_MAX))
+				return invalid(-32602, "customLayout must be a positive layout index");
+			if (httpCommand == HttpCommand::AddSlide && params.contains("customLayoutName") &&
+				(!params["customLayoutName"].is_string() || params["customLayoutName"].get_ref<const std::string &>().empty()))
+				return invalid(-32602, "customLayoutName must be a non-empty string");
+			if (httpCommand == HttpCommand::AddShape)
+			{
+				if (!params.contains("shapeType") || !IntegerInRange(params["shapeType"], 1, 255))
+					return invalid(-32602, "createShape requires shapeType from 1 through 255");
+				for (const char *field : { "left", "top", "width", "height" })
+				{
+					if (!params.contains(field) || !params[field].is_number() ||
+						!std::isfinite(params[field].get<double>()))
+						return invalid(-32602, "createShape requires finite left, top, width, and height values");
+				}
+				if (params["width"].get<double>() <= 0 || params["height"].get<double>() <= 0)
+					return invalid(-32602, "createShape width and height must be positive");
+				if (params.contains("text"))
+					return invalid(-32602, "createShape does not accept text; use setShapeText");
+			}
+		}
 		auto call = std::make_shared<PendingCall>(operation);
 		call->cancelled = cancelled;
 		call->deadline = received + std::chrono::milliseconds(timeoutMs);
-		if (operation == PendingCall::Operation::NewPresentation && params.contains("title"))
-			call->text = params["title"].get<std::string>();
-		else if (operation == PendingCall::Operation::SetSlideTitle)
+		if (operation == PendingCall::Operation::NewPresentation)
 		{
-			call->slideIndex = params["slideIndex"].get<int>();
-			call->text = params["text"].get<std::string>();
+			call->name = params["name"].get<std::string>();
+			call->directory = params["directory"].get<std::string>();
+		}
+		else if (operation == PendingCall::Operation::PrepareShutdown)
+			call->force = params.value("force", false);
+		else if (operation == PendingCall::Operation::Http)
+		{
+			call->httpCommand = httpCommand;
+			call->text = httpCommand == HttpCommand::New ? params["path"].get<std::string>() :
+				params.contains("targetId") ? params["targetId"].get<std::string>() : std::string();
+			call->parameters = params;
+			if (httpCommand == HttpCommand::Close)
+				call->force = params.value("force", false);
+			if (params.contains("slideId") && IntegerInRange(params["slideId"], 1, INT_MAX))
+				call->slideId = params["slideId"].get<long>();
+			if (params.contains("shapeId") && IntegerInRange(params["shapeId"], 1, INT_MAX))
+				call->shapeId = params["shapeId"].get<long>();
 		}
 		Status status = Dispatch(call);
 		if (!status.ok())
@@ -344,7 +473,8 @@ nlohmann::json AutomationDispatcher::HandleRequest(const nlohmann::json &request
 }
 
 nlohmann::json AutomationDispatcher::HandleHttpRequest(HttpCommand command,
-	const std::string &argument, bool force, const std::shared_ptr<std::atomic_bool> &cancelled)
+	const std::string &argument, long slideId, long shapeId, bool force,
+	const nlohmann::json &parameters, const std::shared_ptr<std::atomic_bool> &cancelled)
 {
 	const auto received = std::chrono::steady_clock::now();
 	auto reply = [](const Status &status)
@@ -358,15 +488,56 @@ nlohmann::json AutomationDispatcher::HandleHttpRequest(HttpCommand command,
 		if (argument.size() > MaximumHttpArgumentBytes || argument.find('\0') != std::string::npos)
 			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP document argument",
 				"Argument exceeds 1 MiB or contains a null character"));
-		if ((command == HttpCommand::Activate || command == HttpCommand::Close) && !IsTargetId(argument))
-			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP document target",
-				"Target must be a canonical GUID"));
-		if (command != HttpCommand::Version && command != HttpCommand::List &&
-			command != HttpCommand::New && command != HttpCommand::Activate && command != HttpCommand::Close)
-			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP command"));
+		if ((command == HttpCommand::Activate || command == HttpCommand::Close ||
+			command == HttpCommand::Presentation || command == HttpCommand::Slides ||
+			command == HttpCommand::Slide || command == HttpCommand::View ||
+			command == HttpCommand::SlideShow || command == HttpCommand::AddSlide ||
+			command == HttpCommand::AddShape || command == HttpCommand::SetShapeText ||
+			command == HttpCommand::DeleteShape || command == HttpCommand::DeleteSlide ||
+			command == HttpCommand::SetCurrentSlide || command == HttpCommand::StartSlideShow ||
+			command == HttpCommand::StopSlideShow || command == HttpCommand::NavigateSlideShow ||
+			(FindCommand(command) != nullptr && FindCommand(command)->scope != CommandScope::Application)) &&
+			!IsTargetId(argument))
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP document target", "Target must be a canonical GUID"));
+		if (!parameters.is_object())
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP request body", "Expected a JSON object"));
+		if (command == HttpCommand::NamedNew &&
+			(!parameters.contains("name") || !parameters["name"].is_string() ||
+			 parameters["name"].get_ref<const std::string &>().empty() ||
+			 !parameters.contains("directory") || !parameters["directory"].is_string() ||
+			 parameters["directory"].get_ref<const std::string &>().empty()))
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "Named presentation request",
+				"Expected a non-empty name and absolute directory"));
+		bool navigationGoto = false;
+		if (command == HttpCommand::NavigateSlideShow)
+		{
+			if (!parameters.contains("action") || !parameters["action"].is_string() ||
+				(parameters["action"] != "next" && parameters["action"] != "previous" &&
+				 parameters["action"] != "goto"))
+				return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP request body",
+					"action must be next, previous, or goto"));
+			navigationGoto = parameters["action"] == "goto";
+		}
+		const CommandInfo *info = FindCommand(command);
+		// Route-derived container selectors (the HTTP layer sets these, never the body).
+		const bool slideless = parameters.value("master", false) || (command != HttpCommand::AddSlide &&
+			parameters.contains("customLayout"));
+		if ((command == HttpCommand::Slide || command == HttpCommand::AddShape ||
+			command == HttpCommand::SetShapeText || command == HttpCommand::DeleteShape ||
+			command == HttpCommand::DeleteSlide || command == HttpCommand::SetCurrentSlide ||
+			(command == HttpCommand::NavigateSlideShow && navigationGoto) ||
+			(info != nullptr && info->scope != CommandScope::Application &&
+			 info->scope != CommandScope::Target)) && !slideless && slideId < 1)
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP slide id", "Slide ID must be a positive int32"));
+		if ((command == HttpCommand::SetShapeText || command == HttpCommand::DeleteShape ||
+			(info != nullptr && info->scope == CommandScope::Shape)) && shapeId < 1)
+			return reply(ErrorStatus(-32602, E_INVALIDARG, "HTTP shape id", "Shape ID must be a positive int32"));
 		auto call = std::make_shared<PendingCall>(PendingCall::Operation::Http);
 		call->httpCommand = command;
 		call->text = argument;
+		call->slideId = slideId;
+		call->shapeId = shapeId;
+		call->parameters = parameters;
 		call->force = force;
 		call->cancelled = cancelled;
 		call->deadline = received + std::chrono::milliseconds(10000);
@@ -511,11 +682,12 @@ void AutomationDispatcher::DispatchOnSta()
 				if (call->operation == PendingCall::Operation::GetStatus)
 					result["processId"] = GetCurrentProcessId();
 				else if (call->operation == PendingCall::Operation::NewPresentation)
-					status = CreatePresentation(call->text, result);
-				else if (call->operation == PendingCall::Operation::Http)
-					status = DispatchHttp(call->httpCommand, call->text, call->force, result);
+					status = CreatePresentation(call->name, call->directory, result);
+				else if (call->operation == PendingCall::Operation::PrepareShutdown)
+					status = ValidateShutdown(call->force);
 				else
-					status = UpdateSlideTitle(call->slideIndex, call->text);
+					status = DispatchHttp(call->httpCommand, call->text, call->slideId,
+						call->shapeId, call->force, call->parameters, result);
 				// A running COM call may complete after cancellation, but its late
 				// completion must not become a successful deadline/connection reply.
 				if (call->IsCancelled())
@@ -935,12 +1107,19 @@ AutomationDispatcher::Status AutomationDispatcher::ActivateDocument(IDispatch *d
 }
 
 AutomationDispatcher::Status AutomationDispatcher::DispatchHttp(HttpCommand command,
-	const std::string &argument, bool force, nlohmann::json &result)
+	const std::string &argument, long slideId, long shapeId, bool force,
+	const nlohmann::json &parameters, nlohmann::json &result)
 {
+	const CommandInfo *info = FindCommand(command);
+	if (info != nullptr && info->scope == CommandScope::Application)
+		return RunCommand(*info, nullptr, std::string(), 0, 0, parameters, result);
 	if (command == HttpCommand::Version)
 		return ApplicationMetadata(result);
 	if (command == HttpCommand::New)
 		return OpenDocument(argument, result);
+	if (command == HttpCommand::NamedNew)
+		return CreatePresentation(parameters["name"].get<std::string>(),
+			parameters["directory"].get<std::string>(), result);
 	nlohmann::json list;
 	Status status = RefreshTargets(list);
 	if (!status.ok())
@@ -964,6 +1143,24 @@ AutomationDispatcher::Status AutomationDispatcher::DispatchHttp(HttpCommand comm
 	// Retain both references locally before any reentrant COM call.
 	ATL::CComPtr<IDispatch> document = position->document;
 	ATL::CComPtr<IUnknown> identity = position->identity;
+	if (command == HttpCommand::Presentation)
+		return GetPresentationState(document, id, result);
+	if (command == HttpCommand::Slides)
+		return GetSlides(document, id, result);
+	if (command == HttpCommand::Slide)
+		return GetSlideState(document, id, slideId, result);
+	if (command == HttpCommand::View)
+		return GetViewState(document, id, result);
+	if (command == HttpCommand::SlideShow)
+		return GetSlideShowState(document, id, result);
+	if (command == HttpCommand::AddSlide || command == HttpCommand::AddShape ||
+		command == HttpCommand::SetShapeText || command == HttpCommand::DeleteShape ||
+		command == HttpCommand::DeleteSlide || command == HttpCommand::SetCurrentSlide ||
+		command == HttpCommand::StartSlideShow || command == HttpCommand::StopSlideShow ||
+		command == HttpCommand::NavigateSlideShow)
+		return MutatePresentation(command, document, id, slideId, shapeId, parameters, result);
+	if (info != nullptr)
+		return RunCommand(*info, document, id, slideId, shapeId, parameters, result);
 	if (command == HttpCommand::Activate)
 		return ActivateDocument(document);
 	if (!force)
@@ -974,7 +1171,7 @@ AutomationDispatcher::Status AutomationDispatcher::DispatchHttp(HttpCommand comm
 			return status;
 		if (saved != -1) // msoTrue
 			return ErrorStatus(-32005, HRESULT_FROM_WIN32(ERROR_CANCELLED), "Closing document",
-				"Document has unsaved changes; use the force query flag to discard them");
+				"Document has unsaved changes; force is required to discard them");
 	}
 	else
 	{
@@ -997,34 +1194,873 @@ AutomationDispatcher::Status AutomationDispatcher::DispatchHttp(HttpCommand comm
 	return {};
 }
 
-AutomationDispatcher::Status AutomationDispatcher::PutSlideTitle(IDispatch *slide, ATL::CComVariant &text)
+AutomationDispatcher::Status AutomationDispatcher::GetDouble(IDispatch *object,
+	const wchar_t *name, double &result)
+{
+	ATL::CComVariant value;
+	Status status = Invoke(object, name, DISPATCH_PROPERTYGET, nullptr, 0, &value);
+	if (!status.ok())
+		return status;
+	HRESULT hr = value.ChangeType(VT_R8);
+	if (FAILED(hr))
+		return ErrorStatus(-32000, hr, MemberName(name));
+	result = value.dblVal;
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetBoolean(IDispatch *object,
+	const wchar_t *name, bool &result)
+{
+	long value = 0;
+	Status status = GetInteger(object, name, value);
+	if (!status.ok())
+		return status;
+	result = value != 0;
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetSlideById(IDispatch *document,
+	long slideId, ATL::CComPtr<IDispatch> &slide, long &index)
+{
+	ATL::CComPtr<IDispatch> slides;
+	Status status = GetObject(document, L"Slides", slides);
+	if (!status.ok())
+		return status;
+	long count = 0;
+	status = GetInteger(slides, L"Count", count);
+	if (!status.ok())
+		return status;
+	for (long position = 1; position <= count; ++position)
+	{
+		ATL::CComVariant argument(position);
+		ATL::CComVariant value;
+		status = Invoke(slides, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+			&argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> candidate;
+		status = ReadObject(value, L"Slides.Item", candidate, -32000);
+		if (!status.ok())
+			return status;
+		long candidateId = 0;
+		status = GetInteger(candidate, L"SlideID", candidateId);
+		if (!status.ok())
+			return status;
+		if (candidateId == slideId)
+		{
+			slide = candidate;
+			index = position;
+			return {};
+		}
+	}
+	return ErrorStatus(-32004, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Slide target",
+		"Unknown slide ID in this presentation");
+}
+
+AutomationDispatcher::Status AutomationDispatcher::ReadSlide(IDispatch *slide,
+	long slideId, long index, nlohmann::json &result, bool includeShapes)
+{
+	std::string name;
+	Status status = GetString(slide, L"Name", name);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IDispatch> transition;
+	status = GetObject(slide, L"SlideShowTransition", transition);
+	if (!status.ok())
+		return status;
+	bool hidden = false;
+	status = GetBoolean(transition, L"Hidden", hidden);
+	if (!status.ok())
+		return status;
+	result = { { "slideId", slideId }, { "slideIndex", index }, { "name", std::move(name) },
+		{ "hidden", hidden } };
+	if (!includeShapes)
+		return {};
+
+	ATL::CComPtr<IDispatch> shapes;
+	status = GetObject(slide, L"Shapes", shapes);
+	if (!status.ok())
+		return status;
+	long shapeCount = 0;
+	status = GetInteger(shapes, L"Count", shapeCount);
+	if (!status.ok())
+		return status;
+	auto shapeResults = nlohmann::json::array();
+	for (long shapeIndex = 1; shapeIndex <= shapeCount; ++shapeIndex)
+	{
+		ATL::CComVariant argument(shapeIndex);
+		ATL::CComVariant value;
+		status = Invoke(shapes, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+			&argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> shape;
+		status = ReadObject(value, L"Shapes.Item", shape, -32000);
+		if (!status.ok())
+			return status;
+		nlohmann::json shapeResult;
+		status = DescribeShape(shape, shapeResult);
+		if (!status.ok())
+			return status;
+		shapeResults.push_back(std::move(shapeResult));
+	}
+	result["shapes"] = std::move(shapeResults);
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::DescribeShape(IDispatch *shape, nlohmann::json &result)
+{
+	long shapeId = 0, zOrder = 0, type = 0;
+	Status status = GetInteger(shape, L"Id", shapeId);
+	if (!status.ok())
+		return status;
+	status = GetInteger(shape, L"ZOrderPosition", zOrder);
+	if (!status.ok())
+		return status;
+	status = GetInteger(shape, L"Type", type);
+	if (!status.ok())
+		return status;
+	std::string shapeName;
+	status = GetString(shape, L"Name", shapeName);
+	if (!status.ok())
+		return status;
+	double left = 0, top = 0, width = 0, height = 0;
+	status = GetDouble(shape, L"Left", left);
+	if (!status.ok())
+		return status;
+	status = GetDouble(shape, L"Top", top);
+	if (!status.ok())
+		return status;
+	status = GetDouble(shape, L"Width", width);
+	if (!status.ok())
+		return status;
+	status = GetDouble(shape, L"Height", height);
+	if (!status.ok())
+		return status;
+	result = {
+		{ "shapeId", shapeId }, { "zOrderPosition", zOrder }, { "name", std::move(shapeName) },
+		{ "shapeType", type }, { "text", nullptr },
+		{ "bounds", { { "left", left }, { "top", top }, { "width", width }, { "height", height } } }
+	};
+	if (type == 14) // msoPlaceholder
+	{
+		ATL::CComPtr<IDispatch> placeholder;
+		Status optional = GetObject(shape, L"PlaceholderFormat", placeholder);
+		if (optional.ok())
+		{
+			long placeholderType = 0;
+			optional = GetInteger(placeholder, L"Type", placeholderType);
+			if (optional.ok())
+				result["placeholderType"] = placeholderType;
+		}
+		else if (IsStopping())
+			return StoppedStatus();
+	}
+	if (type == 6) // msoGroup
+	{
+		ATL::CComPtr<IDispatch> items;
+		status = GetObject(shape, L"GroupItems", items);
+		if (!status.ok())
+			return status;
+		long count = 0;
+		status = GetInteger(items, L"Count", count);
+		if (!status.ok())
+			return status;
+		auto children = nlohmann::json::array();
+		for (long index = 1; index <= count; ++index)
+		{
+			ATL::CComPtr<IDispatch> child;
+			status = GetItem(items, index, child);
+			if (!status.ok())
+				return status;
+			nlohmann::json childResult;
+			status = DescribeShape(child, childResult);
+			if (!status.ok())
+				return status;
+			children.push_back(std::move(childResult));
+		}
+		result["groupItems"] = std::move(children);
+		return {};
+	}
+	ATL::CComPtr<IDispatch> textFrame;
+	Status textStatus = GetObject(shape, L"TextFrame", textFrame);
+	if (textStatus.ok())
+	{
+		bool hasText = false;
+		textStatus = GetBoolean(textFrame, L"HasText", hasText);
+		if (textStatus.ok() && hasText)
+		{
+			ATL::CComPtr<IDispatch> textRange;
+			textStatus = GetObject(textFrame, L"TextRange", textRange);
+			if (textStatus.ok())
+			{
+				std::string text;
+				textStatus = GetString(textRange, L"Text", text);
+				if (textStatus.ok())
+					result["text"] = std::move(text);
+			}
+		}
+	}
+	if (!textStatus.ok() && IsStopping())
+		return StoppedStatus();
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetPresentationState(IDispatch *document,
+	const std::string &id, nlohmann::json &result)
+{
+	nlohmann::json descriptor;
+	Status status = DescribeDocument(document, id, descriptor);
+	if (!status.ok())
+		return status;
+	long saved = 0, readOnly = 0, slideCount = 0;
+	status = GetInteger(document, L"Saved", saved);
+	if (!status.ok())
+		return status;
+	status = GetInteger(document, L"ReadOnly", readOnly);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IDispatch> slides;
+	status = GetObject(document, L"Slides", slides);
+	if (!status.ok())
+		return status;
+	status = GetInteger(slides, L"Count", slideCount);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IDispatch> pageSetup;
+	status = GetObject(document, L"PageSetup", pageSetup);
+	if (!status.ok())
+		return status;
+	double slideWidth = 0, slideHeight = 0;
+	status = GetDouble(pageSetup, L"SlideWidth", slideWidth);
+	if (!status.ok())
+		return status;
+	status = GetDouble(pageSetup, L"SlideHeight", slideHeight);
+	if (!status.ok())
+		return status;
+	result = { { "id", id }, { "name", descriptor["title"] }, { "url", descriptor["url"] },
+		{ "saved", saved != 0 }, { "readOnly", readOnly != 0 }, { "slideCount", slideCount },
+		{ "slideWidth", slideWidth }, { "slideHeight", slideHeight } };
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetSlides(IDispatch *document,
+	const std::string &id, nlohmann::json &result)
+{
+	ATL::CComPtr<IDispatch> slides;
+	Status status = GetObject(document, L"Slides", slides);
+	if (!status.ok())
+		return status;
+	long count = 0;
+	status = GetInteger(slides, L"Count", count);
+	if (!status.ok())
+		return status;
+	auto slideResults = nlohmann::json::array();
+	for (long index = 1; index <= count; ++index)
+	{
+		ATL::CComVariant argument(index);
+		ATL::CComVariant value;
+		status = Invoke(slides, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+			&argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> slide;
+		status = ReadObject(value, L"Slides.Item", slide, -32000);
+		if (!status.ok())
+			return status;
+		long slideId = 0;
+		status = GetInteger(slide, L"SlideID", slideId);
+		if (!status.ok())
+			return status;
+		nlohmann::json summary;
+		status = ReadSlide(slide, slideId, index, summary, false);
+		if (!status.ok())
+			return status;
+		slideResults.push_back(std::move(summary));
+	}
+	result = { { "id", id }, { "slides", std::move(slideResults) } };
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetSlideState(IDispatch *document,
+	const std::string &id, long slideId, nlohmann::json &result)
+{
+	long index = 0;
+	ATL::CComPtr<IDispatch> slide;
+	Status status = GetSlideById(document, slideId, slide, index);
+	if (!status.ok())
+		return status;
+	nlohmann::json slideState;
+	status = ReadSlide(slide, slideId, index, slideState, true);
+	if (!status.ok())
+		return status;
+	result = { { "id", id }, { "slide", std::move(slideState) } };
+	return {};
+}
+AutomationDispatcher::Status AutomationDispatcher::GetViewState(IDispatch *document,
+	const std::string &id, nlohmann::json &result)
+{
+	ATL::CComPtr<IDispatch> windows;
+	Status status = GetObject(document, L"Windows", windows);
+	if (!status.ok())
+		return status;
+	long count = 0;
+	status = GetInteger(windows, L"Count", count);
+	if (!status.ok())
+		return status;
+	auto windowResults = nlohmann::json::array();
+	for (long index = 1; index <= count; ++index)
+	{
+		ATL::CComVariant argument(index);
+		ATL::CComVariant value;
+		status = Invoke(windows, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+			&argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> window;
+		status = ReadObject(value, L"Windows.Item", window, -32000);
+		if (!status.ok())
+			return status;
+		long viewType = 0;
+		status = GetInteger(window, L"ViewType", viewType);
+		if (!status.ok())
+			return status;
+		nlohmann::json windowResult = { { "viewType", viewType }, { "currentSlideId", nullptr },
+			{ "currentSlideIndex", nullptr }, { "selection", nullptr } };
+		ATL::CComPtr<IDispatch> view;
+		Status optional = GetObject(window, L"View", view);
+		if (optional.ok())
+		{
+			ATL::CComPtr<IDispatch> currentSlide;
+			optional = GetObject(view, L"Slide", currentSlide);
+			if (optional.ok())
+			{
+				long currentSlideId = 0, currentSlideIndex = 0;
+				optional = GetInteger(currentSlide, L"SlideID", currentSlideId);
+				if (optional.ok())
+					optional = GetInteger(currentSlide, L"SlideIndex", currentSlideIndex);
+				if (optional.ok())
+				{
+					windowResult["currentSlideId"] = currentSlideId;
+					windowResult["currentSlideIndex"] = currentSlideIndex;
+				}
+			}
+		}
+		if (IsStopping())
+			return StoppedStatus();
+		ATL::CComPtr<IDispatch> selection;
+		optional = GetObject(window, L"Selection", selection);
+		if (optional.ok())
+		{
+			long selectionType = 0;
+			optional = GetInteger(selection, L"Type", selectionType);
+			if (optional.ok())
+			{
+				nlohmann::json selectionResult = { { "type", selectionType } };
+				if (selectionType == 2) // ppSelectionShapes
+				{
+					ATL::CComPtr<IDispatch> range;
+					optional = GetObject(selection, L"ShapeRange", range);
+					long selectedCount = 0;
+					if (optional.ok())
+						optional = GetInteger(range, L"Count", selectedCount);
+					if (optional.ok())
+					{
+						auto selectedShapes = nlohmann::json::array();
+						for (long selectedIndex = 1; selectedIndex <= selectedCount; ++selectedIndex)
+						{
+							ATL::CComVariant selectedArgument(selectedIndex);
+							ATL::CComVariant selectedValue;
+							optional = Invoke(range, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+								&selectedArgument, 1, &selectedValue);
+							if (!optional.ok())
+								break;
+							ATL::CComPtr<IDispatch> selectedShape;
+							optional = ReadObject(selectedValue, L"ShapeRange.Item", selectedShape, -32000);
+							if (!optional.ok())
+								break;
+							long selectedShapeId = 0;
+							optional = GetInteger(selectedShape, L"Id", selectedShapeId);
+							if (!optional.ok())
+								break;
+							selectedShapes.push_back(selectedShapeId);
+						}
+						if (optional.ok())
+							selectionResult["shapeIds"] = std::move(selectedShapes);
+					}
+				}
+				windowResult["selection"] = std::move(selectionResult);
+			}
+		}
+		if (IsStopping())
+			return StoppedStatus();
+		windowResults.push_back(std::move(windowResult));
+	}
+	result = { { "id", id }, { "available", count > 0 }, { "windows", std::move(windowResults) } };
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetSlideShowState(IDispatch *document,
+	const std::string &id, nlohmann::json &result)
+{
+	ATL::CComPtr<IDispatch> application = m_pApplication;
+	ATL::CComPtr<IDispatch> showWindows;
+	Status status = GetObject(application, L"SlideShowWindows", showWindows);
+	if (!status.ok())
+		return status;
+	long count = 0;
+	status = GetInteger(showWindows, L"Count", count);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IUnknown> targetIdentity;
+	HRESULT hr = document->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&targetIdentity));
+	if (IsStopping())
+		return StoppedStatus();
+	if (FAILED(hr))
+		return ErrorStatus(-32000, hr, "Presentation identity");
+	auto showResults = nlohmann::json::array();
+	for (long index = 1; index <= count; ++index)
+	{
+		ATL::CComVariant argument(index);
+		ATL::CComVariant value;
+		status = Invoke(showWindows, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+			&argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> showWindow;
+		status = ReadObject(value, L"SlideShowWindows.Item", showWindow, -32000);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> showPresentation;
+		status = GetObject(showWindow, L"Presentation", showPresentation);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IUnknown> showIdentity;
+		hr = showPresentation->QueryInterface(IID_IUnknown,
+			reinterpret_cast<void **>(&showIdentity));
+		if (IsStopping())
+			return StoppedStatus();
+		if (FAILED(hr))
+			return ErrorStatus(-32000, hr, "Slide-show presentation identity");
+		if (showIdentity.p != targetIdentity.p)
+			continue;
+		ATL::CComPtr<IDispatch> view;
+		status = GetObject(showWindow, L"View", view);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> currentSlide;
+		status = GetObject(view, L"Slide", currentSlide);
+		if (!status.ok())
+			return status;
+		long currentSlideId = 0, currentSlideIndex = 0, showPosition = 0;
+		status = GetInteger(currentSlide, L"SlideID", currentSlideId);
+		if (!status.ok())
+			return status;
+		status = GetInteger(currentSlide, L"SlideIndex", currentSlideIndex);
+		if (!status.ok())
+			return status;
+		status = GetInteger(view, L"CurrentShowPosition", showPosition);
+		if (!status.ok())
+			return status;
+		showResults.push_back({ { "currentSlideId", currentSlideId },
+			{ "currentSlideIndex", currentSlideIndex }, { "currentShowPosition", showPosition } });
+	}
+	result = { { "id", id }, { "running", !showResults.empty() }, { "windows", std::move(showResults) } };
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::GetShapeById(IDispatch *slide, long shapeId,
+	ATL::CComPtr<IDispatch> &shape)
 {
 	ATL::CComPtr<IDispatch> shapes;
 	Status status = GetObject(slide, L"Shapes", shapes);
 	if (!status.ok())
 		return status;
-	ATL::CComPtr<IDispatch> title;
-	status = GetObject(shapes, L"Title", title, -32001);
+	long count = 0;
+	status = GetInteger(shapes, L"Count", count);
 	if (!status.ok())
 		return status;
-	ATL::CComPtr<IDispatch> textFrame;
-	status = GetObject(title, L"TextFrame", textFrame);
-	if (!status.ok())
-		return status;
-	ATL::CComPtr<IDispatch> textRange;
-	status = GetObject(textFrame, L"TextRange", textRange);
-	if (!status.ok())
-		return status;
-	return Invoke(textRange, L"Text", DISPATCH_PROPERTYPUT, &text, 1, nullptr);
+	for (long index = 1; index <= count; ++index)
+	{
+		ATL::CComVariant argument(index), value;
+		status = Invoke(shapes, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> candidate;
+		status = ReadObject(value, L"Shapes.Item", candidate, -32000);
+		if (!status.ok())
+			return status;
+		long candidateId = 0;
+		status = GetInteger(candidate, L"Id", candidateId);
+		if (!status.ok())
+			return status;
+		if (candidateId == shapeId)
+		{
+			shape = candidate;
+			return {};
+		}
+	}
+	return ErrorStatus(-32004, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Shape ID",
+		"Shape ID was not found on the requested slide");
 }
 
-AutomationDispatcher::Status AutomationDispatcher::CreatePresentation(const std::string &title,
-	nlohmann::json &result)
+AutomationDispatcher::Status AutomationDispatcher::MutatePresentation(HttpCommand command,
+	IDispatch *document, const std::string &id, long slideId, long shapeId,
+	const nlohmann::json &parameters, nlohmann::json &result)
 {
-	ATL::CComVariant titleText;
-	HRESULT hr = Utf8ToVariant(title, titleText);
+	auto invalid = [](const char *message)
+	{
+		return ErrorStatus(-32602, E_INVALIDARG, "PowerPoint mutation parameters", message);
+	};
+	long slideIndex = 0;
+	ATL::CComPtr<IDispatch> slide;
+	const bool master = parameters.contains("master") && parameters["master"].is_boolean() &&
+		parameters["master"].get<bool>();
+	const long layoutContainer = command != HttpCommand::AddSlide && parameters.contains("customLayout") &&
+		IntegerInRange(parameters["customLayout"], 1, INT_MAX) ? parameters["customLayout"].get<long>() : 0;
+	auto container = [&](nlohmann::json fields)
+	{
+		nlohmann::json identity = { { "id", id } };
+		if (layoutContainer > 0)
+			identity["customLayout"] = layoutContainer;
+		else if (master)
+			identity["master"] = true;
+		else
+			identity["slideId"] = slideId;
+		identity.update(fields);
+		return identity;
+	};
+	if (command == HttpCommand::AddSlide)
+	{
+		long layout = 12; // ppLayoutBlank
+		if (parameters.contains("layout"))
+		{
+			if (!IntegerInRange(parameters["layout"], 1, 12))
+				return invalid("layout must be an integer from 1 through 12");
+			layout = parameters["layout"].get<long>();
+		}
+		ATL::CComPtr<IDispatch> slides;
+		Status status = GetObject(document, L"Slides", slides);
+		if (!status.ok())
+			return status;
+		long count = 0;
+		status = GetInteger(slides, L"Count", count);
+		if (!status.ok())
+			return status;
+		ATL::CComVariant value;
+		if (parameters.contains("customLayout") || parameters.contains("customLayoutName"))
+		{
+			if (static_cast<int>(parameters.contains("layout")) + static_cast<int>(parameters.contains("customLayout")) +
+				static_cast<int>(parameters.contains("customLayoutName")) > 1)
+				return invalid("addSlide accepts only one of layout, customLayout, or customLayoutName");
+			ATL::CComPtr<IDispatch> customLayout;
+			long layoutIndex = 0;
+			if (parameters.contains("customLayout"))
+			{
+				if (!IntegerInRange(parameters["customLayout"], 1, INT_MAX))
+					return invalid("customLayout must be a positive layout index");
+				layoutIndex = parameters["customLayout"].get<long>();
+				status = GetCustomLayout(document, layoutIndex, customLayout);
+			}
+			else
+			{
+				if (!parameters["customLayoutName"].is_string() ||
+					parameters["customLayoutName"].get_ref<const std::string &>().empty())
+					return invalid("customLayoutName must be a non-empty string");
+				status = FindCustomLayout(document, parameters["customLayoutName"].get<std::string>(),
+					customLayout, layoutIndex);
+			}
+			if (!status.ok())
+				return status;
+			status = CallMethod(slides, L"AddSlide",
+				{ ATL::CComVariant(count + 1), ATL::CComVariant(customLayout.p) }, &value);
+			if (status.ok())
+				result["customLayout"] = layoutIndex;
+		}
+		else
+		{
+			ATL::CComVariant arguments[2] = { ATL::CComVariant(layout), ATL::CComVariant(count + 1) };
+			status = Invoke(slides, L"Add", DISPATCH_METHOD, arguments, 2, &value);
+		}
+		if (!status.ok())
+			return status;
+		status = ReadObject(value, L"Slides.Add", slide, -32000);
+		if (!status.ok())
+			return status;
+		long newSlideId = 0;
+		status = GetInteger(slide, L"SlideID", newSlideId);
+		if (!status.ok())
+			return status;
+		status = GetInteger(slide, L"SlideIndex", slideIndex);
+		if (!status.ok())
+			return status;
+		result.update({ { "id", id }, { "slideId", newSlideId }, { "slideIndex", slideIndex } });
+		return {};
+	}
+
+	if (command == HttpCommand::AddShape || command == HttpCommand::SetShapeText ||
+		command == HttpCommand::DeleteShape)
+	{
+		Status status = ResolveContainer(document, slideId, master, layoutContainer, slide, slideIndex);
+		if (!status.ok())
+			return status;
+	}
+	if (command == HttpCommand::DeleteSlide || command == HttpCommand::SetCurrentSlide ||
+		(command == HttpCommand::NavigateSlideShow && parameters.value("action", "") == "goto"))
+	{
+		Status status = GetSlideById(document, slideId, slide, slideIndex);
+		if (!status.ok())
+			return status;
+	}
+	if (command == HttpCommand::AddShape)
+	{
+		if (!parameters.contains("shapeType") || !IntegerInRange(parameters["shapeType"], 1, 255))
+			return invalid("shapeType must be an integer from 1 through 255");
+		for (const char *field : { "left", "top", "width", "height" })
+		{
+			if (!parameters.contains(field) || !parameters[field].is_number() ||
+				!std::isfinite(parameters[field].get<double>()))
+				return invalid("left, top, width, and height must be finite numbers");
+		}
+		double left = parameters["left"].get<double>();
+		double top = parameters["top"].get<double>();
+		double width = parameters["width"].get<double>();
+		double height = parameters["height"].get<double>();
+		if (width <= 0 || height <= 0)
+			return invalid("width and height must be positive");
+		if (parameters.contains("text"))
+			return invalid("createShape does not accept text; use setShapeText");
+		long shapeType = parameters["shapeType"].get<long>();
+		ATL::CComPtr<IDispatch> shapes;
+		Status status = GetObject(slide, L"Shapes", shapes);
+		if (!status.ok())
+			return status;
+		ATL::CComVariant arguments[5] = {
+			ATL::CComVariant(height), ATL::CComVariant(width), ATL::CComVariant(top),
+			ATL::CComVariant(left), ATL::CComVariant(shapeType)
+		};
+		ATL::CComVariant value;
+		status = Invoke(shapes, L"AddShape", DISPATCH_METHOD, arguments, 5, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> shape;
+		status = ReadObject(value, L"Shapes.AddShape", shape, -32000);
+		if (!status.ok())
+			return status;
+		long newShapeId = 0;
+		status = GetInteger(shape, L"Id", newShapeId);
+		if (!status.ok())
+			return status;
+		result = container({ { "shapeId", newShapeId } });
+		return {};
+	}
+	if (command == HttpCommand::SetShapeText || command == HttpCommand::DeleteShape)
+	{
+		ATL::CComPtr<IDispatch> shape;
+		Status status = GetShapeById(slide, shapeId, shape);
+		if (!status.ok())
+			return status;
+		if (command == HttpCommand::DeleteShape)
+		{
+			status = Invoke(shape, L"Delete", DISPATCH_METHOD, nullptr, 0, nullptr);
+			if (!status.ok())
+				return status;
+			result = container({ { "shapeId", shapeId }, { "deleted", true } });
+			return {};
+		}
+		if (!parameters.contains("text") || !parameters["text"].is_string())
+			return invalid("text must be a string");
+		ATL::CComVariant text;
+		HRESULT hr = Utf8ToVariant(parameters["text"].get<std::string>(), text);
+		if (FAILED(hr))
+			return ErrorStatus(hr == E_OUTOFMEMORY ? -32000 : -32602, hr, "Encoding shape text");
+		ATL::CComPtr<IDispatch> textFrame, textRange;
+		status = GetObject(shape, L"TextFrame", textFrame);
+		if (!status.ok())
+			return status;
+		status = GetObject(textFrame, L"TextRange", textRange);
+		if (!status.ok())
+			return status;
+		status = Invoke(textRange, L"Text", DISPATCH_PROPERTYPUT, &text, 1, nullptr);
+		if (!status.ok())
+			return status;
+		result = container({ { "shapeId", shapeId }, { "text", parameters["text"] } });
+		return {};
+	}
+	if (command == HttpCommand::DeleteSlide)
+	{
+		Status status = Invoke(slide, L"Delete", DISPATCH_METHOD, nullptr, 0, nullptr);
+		if (!status.ok())
+			return status;
+		result = { { "id", id }, { "slideId", slideId }, { "deleted", true } };
+		return {};
+	}
+	if (command == HttpCommand::SetCurrentSlide)
+	{
+		ATL::CComPtr<IDispatch> windows;
+		Status status = GetObject(document, L"Windows", windows);
+		if (!status.ok())
+			return status;
+		long count = 0;
+		status = GetInteger(windows, L"Count", count);
+		if (!status.ok())
+			return status;
+		if (count == 0)
+			return ErrorStatus(-32001, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Set current slide",
+				"The presentation has no document window");
+		ATL::CComVariant index(1L), value;
+		status = Invoke(windows, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &index, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> window;
+		status = ReadObject(value, L"Windows.Item", window, -32000);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> view;
+		status = GetObject(window, L"View", view);
+		if (!status.ok())
+			return status;
+		ATL::CComVariant slideIndexArgument(slideIndex);
+		status = Invoke(view, L"GotoSlide", DISPATCH_METHOD, &slideIndexArgument, 1, nullptr);
+		if (!status.ok())
+			return status;
+		result = { { "id", id }, { "slideId", slideId }, { "slideIndex", slideIndex } };
+		return {};
+	}
+
+	ATL::CComPtr<IDispatch> application = m_pApplication;
+	ATL::CComPtr<IDispatch> showWindows;
+	Status status = GetObject(application, L"SlideShowWindows", showWindows);
+	if (!status.ok())
+		return status;
+	long showCount = 0;
+	status = GetInteger(showWindows, L"Count", showCount);
+	if (!status.ok())
+		return status;
+	ATL::CComPtr<IUnknown> targetIdentity;
+	HRESULT hr = document->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&targetIdentity));
+	if (IsStopping())
+		return StoppedStatus();
 	if (FAILED(hr))
-		return ErrorStatus(hr == E_OUTOFMEMORY ? -32000 : -32602, hr, "Decoding presentation title as UTF-8");
+		return ErrorStatus(-32000, hr, "Slide-show presentation identity");
+	bool foundShow = false;
+	for (long index = showCount; index >= 1; --index)
+	{
+		ATL::CComVariant argument(index), value;
+		status = Invoke(showWindows, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &argument, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> showWindow, showPresentation;
+		status = ReadObject(value, L"SlideShowWindows.Item", showWindow, -32000);
+		if (!status.ok())
+			return status;
+		status = GetObject(showWindow, L"Presentation", showPresentation);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IUnknown> showIdentity;
+		hr = showPresentation->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&showIdentity));
+		if (IsStopping())
+			return StoppedStatus();
+		if (FAILED(hr))
+			return ErrorStatus(-32000, hr, "Slide-show presentation identity");
+		if (showIdentity.p != targetIdentity.p)
+			continue;
+		foundShow = true;
+		ATL::CComPtr<IDispatch> view;
+		status = GetObject(showWindow, L"View", view);
+		if (!status.ok())
+			return status;
+		if (command == HttpCommand::StopSlideShow)
+		{
+			status = Invoke(view, L"Exit", DISPATCH_METHOD, nullptr, 0, nullptr);
+			if (!status.ok())
+				return status;
+		}
+		else if (command == HttpCommand::NavigateSlideShow)
+		{
+			if (!parameters.contains("action") || !parameters["action"].is_string())
+				return invalid("action must be next, previous, or goto");
+			const std::string action = parameters["action"].get<std::string>();
+			if (action == "next")
+				status = Invoke(view, L"Next", DISPATCH_METHOD, nullptr, 0, nullptr);
+			else if (action == "previous")
+				status = Invoke(view, L"Previous", DISPATCH_METHOD, nullptr, 0, nullptr);
+			else if (action == "goto")
+			{
+				if (slideIndex == 0)
+					return invalid("goto requires a valid slideId");
+				ATL::CComVariant gotoIndex(slideIndex);
+				status = Invoke(view, L"GotoSlide", DISPATCH_METHOD, &gotoIndex, 1, nullptr);
+			}
+			else
+				return invalid("action must be next, previous, or goto");
+			if (!status.ok())
+				return status;
+		}
+	}
+	if (command == HttpCommand::StartSlideShow)
+	{
+		ATL::CComPtr<IDispatch> settings;
+		status = GetObject(document, L"SlideShowSettings", settings);
+		if (!status.ok())
+			return status;
+		status = Invoke(settings, L"Run", DISPATCH_METHOD, nullptr, 0, nullptr);
+		if (!status.ok())
+			return status;
+	}
+	else if (!foundShow)
+		return ErrorStatus(-32001, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Slide-show control",
+			"No slide show is running for the requested presentation");
+	return GetSlideShowState(document, id, result);
+}
+
+
+AutomationDispatcher::Status AutomationDispatcher::CreatePresentation(const std::string &name,
+	const std::string &directory, nlohmann::json &result)
+{
+	HRESULT hr = S_OK;
+	if (name.empty() || directory.empty() || name.find('\0') != std::string::npos ||
+		directory.find('\0') != std::string::npos)
+		return ErrorStatus(-32602, E_INVALIDARG, "Presentation filename",
+			"Name and directory must be non-empty and contain no NUL characters");
+	ATL::CComVariant nameText, directoryText;
+	hr = Utf8ToVariant(name, nameText);
+	if (SUCCEEDED(hr))
+		hr = Utf8ToVariant(directory, directoryText);
+	if (FAILED(hr))
+		return ErrorStatus(hr == E_OUTOFMEMORY ? -32000 : -32602, hr, "Decoding presentation filename as UTF-8");
+	std::wstring fileName(nameText.bstrVal, SysStringLen(nameText.bstrVal));
+	if (fileName.size() > 240 || fileName.back() == L'.' ||
+		fileName.back() == L' ' || fileName.find_first_of(L"<>:\"/\\|?*") != std::wstring::npos ||
+		std::any_of(fileName.begin(), fileName.end(), [](wchar_t character) { return character < 32; }))
+		return ErrorStatus(-32602, E_INVALIDARG, "Presentation name",
+			"Use a filename without path separators or reserved Windows characters");
+	std::wstring stem = fileName.substr(0, fileName.find(L'.'));
+	if (_wcsicmp(stem.c_str(), L"CON") == 0 || _wcsicmp(stem.c_str(), L"PRN") == 0 ||
+		_wcsicmp(stem.c_str(), L"AUX") == 0 || _wcsicmp(stem.c_str(), L"NUL") == 0 ||
+		(stem.size() == 4 && stem[3] >= L'1' && stem[3] <= L'9' &&
+			(_wcsnicmp(stem.c_str(), L"COM", 3) == 0 || _wcsnicmp(stem.c_str(), L"LPT", 3) == 0)))
+		return ErrorStatus(-32602, E_INVALIDARG, "Presentation name", "Reserved Windows filename");
+	if (fileName.size() < 5 || _wcsicmp(fileName.c_str() + fileName.size() - 5, L".pptx") != 0)
+		fileName += L".pptx";
+	const std::filesystem::path folder(std::wstring(directoryText.bstrVal,
+		SysStringLen(directoryText.bstrVal)));
+	DWORD folderAttributes = GetFileAttributesW(folder.c_str());
+	if (!folder.is_absolute() || folderAttributes == INVALID_FILE_ATTRIBUTES ||
+		!(folderAttributes & FILE_ATTRIBUTE_DIRECTORY))
+		return ErrorStatus(-32602, E_INVALIDARG, "Presentation directory",
+			"Directory must be an existing absolute directory");
+	std::filesystem::path destination = folder / fileName;
+	DWORD attributes = GetFileAttributesW(destination.c_str());
+	if (attributes != INVALID_FILE_ATTRIBUTES)
+		return ErrorStatus(-32005, HRESULT_FROM_WIN32(ERROR_FILE_EXISTS), "Presentation filename",
+			"A file or directory with that name already exists");
+	DWORD pathError = GetLastError();
+	if (pathError != ERROR_FILE_NOT_FOUND && pathError != ERROR_PATH_NOT_FOUND)
+		return ErrorStatus(-32000, HRESULT_FROM_WIN32(pathError), "Presentation filename");
+	ATL::CComVariant savePath(destination.c_str());
+	if (savePath.vt != VT_BSTR || savePath.bstrVal == nullptr)
+		return ErrorStatus(-32000, E_OUTOFMEMORY, "Presentation filename");
 	// Local Automation references survive reentrant disconnect and release on STA.
 	ATL::CComPtr<IDispatch> application = m_pApplication;
 	ATL::CComPtr<IDispatch> presentations;
@@ -1040,98 +2076,116 @@ AutomationDispatcher::Status AutomationDispatcher::CreatePresentation(const std:
 	status = ReadObject(value, L"Presentations.Add", presentation, -32000);
 	if (!status.ok())
 		return status;
+	auto discard = [this, &presentation](Status error) {
+		ATL::CComVariant saved(-1L); // msoTrue: do not prompt to save on close.
+		Invoke(presentation, L"Saved", DISPATCH_PROPERTYPUT, &saved, 1, nullptr);
+		Invoke(presentation, L"Close", DISPATCH_METHOD, nullptr, 0, nullptr);
+		return error;
+	};
 	ATL::CComPtr<IDispatch> slides;
 	status = GetObject(presentation, L"Slides", slides);
 	if (!status.ok())
-		return status;
-	// IDispatch arguments are right-to-left: ppLayoutTitle, one-based index.
-	ATL::CComVariant arguments[2] = { ATL::CComVariant(1L), ATL::CComVariant(1L) };
-	ATL::CComVariant slideValue;
-	status = Invoke(slides, L"Add", DISPATCH_METHOD, arguments, 2, &slideValue);
+		return discard(status);
+	// Office may change the process working directory while saving. Restore it before
+	// returning to the add-in's STA, including when SaveAs fails.
+	DWORD required = GetCurrentDirectoryW(0, nullptr);
+	if (required == 0)
+		return discard(ErrorStatus(-32000, HRESULT_FROM_WIN32(GetLastError()), "Reading PowerPoint working directory"));
+	std::vector<wchar_t> previousDirectory(required);
+	DWORD length = GetCurrentDirectoryW(required, previousDirectory.data());
+	if (length == 0 || length >= required)
+		return discard(ErrorStatus(-32000, HRESULT_FROM_WIN32(GetLastError()), "Reading PowerPoint working directory"));
+	status = Invoke(presentation, L"SaveAs", DISPATCH_METHOD, &savePath, 1, nullptr);
+	if (!SetCurrentDirectoryW(previousDirectory.data()))
+		return discard(ErrorStatus(-32000, HRESULT_FROM_WIN32(GetLastError()), "Restoring PowerPoint working directory"));
 	if (!status.ok())
-		return status;
-	ATL::CComPtr<IDispatch> slide;
-	status = ReadObject(slideValue, L"Slides.Add", slide, -32000);
+		return discard(status);
+	ATL::CComVariant nameValue;
+	status = Invoke(presentation, L"Name", DISPATCH_PROPERTYGET, nullptr, 0, &nameValue);
 	if (!status.ok())
-		return status;
-	status = PutSlideTitle(slide, titleText);
-	if (!status.ok())
-		return status;
-	ATL::CComVariant name;
-	status = Invoke(presentation, L"Name", DISPATCH_PROPERTYGET, nullptr, 0, &name);
-	if (!status.ok())
-		return status;
-	if (name.vt != VT_BSTR)
-		return ErrorStatus(-32000, DISP_E_TYPEMISMATCH, "PowerPoint.Presentation.Name");
+		return discard(status);
+	if (nameValue.vt != VT_BSTR)
+		return discard(ErrorStatus(-32000, DISP_E_TYPEMISMATCH, "PowerPoint.Presentation.Name"));
 	std::string documentName;
-	hr = BstrToUtf8(name.bstrVal, documentName);
+	hr = BstrToUtf8(nameValue.bstrVal, documentName);
 	if (FAILED(hr))
-		return ErrorStatus(-32000, hr, "Encoding presentation name as UTF-8");
+		return discard(ErrorStatus(-32000, hr, "Encoding presentation name as UTF-8"));
 	long slideCount = 0;
 	status = GetInteger(slides, L"Count", slideCount);
 	if (!status.ok())
-		return status;
+		return discard(status);
 	ATL::CComPtr<IDispatch> windows;
 	status = GetObject(presentation, L"Windows", windows);
 	if (!status.ok())
-		return status;
+		return discard(status);
 	ATL::CComVariant windowIndex(1L);
 	ATL::CComVariant windowValue;
 	status = Invoke(windows, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &windowIndex, 1, &windowValue);
 	if (!status.ok())
-		return status;
+		return discard(status);
 	ATL::CComPtr<IDispatch> window;
 	status = ReadObject(windowValue, L"Windows.Item", window, -32000);
 	if (!status.ok())
-		return status;
+		return discard(status);
 	status = Invoke(window, L"Activate", DISPATCH_METHOD, nullptr, 0, nullptr);
 	if (!status.ok())
-		return status;
+		return discard(status);
 	result = { { "name", std::move(documentName) }, { "slideCount", slideCount } };
+	ATL::CComPtr<IUnknown> identity;
+	hr = presentation->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&identity));
+	if (FAILED(hr))
+		return discard(ErrorStatus(-32000, hr, "Presentation identity"));
+	nlohmann::json targets;
+	status = RefreshTargets(targets);
+	if (!status.ok())
+		return discard(status);
+	auto target = std::find_if(m_targets.begin(), m_targets.end(), [&identity](const DocumentTarget &entry)
+	{
+		return entry.identity.p == identity.p;
+	});
+	if (target == m_targets.end())
+		return discard(ErrorStatus(-32004, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Presentation target"));
+	result["id"] = target->descriptor["id"];
+	result["url"] = target->descriptor["url"];
 	return {};
 }
 
-AutomationDispatcher::Status AutomationDispatcher::UpdateSlideTitle(int slideIndex, const std::string &text)
+AutomationDispatcher::Status AutomationDispatcher::ValidateShutdown(bool force)
 {
-	ATL::CComVariant titleText;
-	HRESULT hr = Utf8ToVariant(text, titleText);
-	if (FAILED(hr))
-		return ErrorStatus(hr == E_OUTOFMEMORY ? -32000 : -32602, hr, "Decoding slide title as UTF-8");
+	// The external COM caller will mark each presentation saved when force is set.
 	ATL::CComPtr<IDispatch> application = m_pApplication;
 	ATL::CComPtr<IDispatch> presentations;
 	Status status = GetObject(application, L"Presentations", presentations);
 	if (!status.ok())
 		return status;
-	long presentationCount = 0;
-	status = GetInteger(presentations, L"Count", presentationCount);
+	long count = 0;
+	status = GetInteger(presentations, L"Count", count);
 	if (!status.ok())
 		return status;
-	if (presentationCount == 0)
-		return ErrorStatus(-32001, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "SetSlideTitle",
-			"There is no active presentation");
-	ATL::CComPtr<IDispatch> presentation;
-	status = GetObject(application, L"ActivePresentation", presentation, -32001);
-	if (!status.ok())
-		return status;
-	ATL::CComPtr<IDispatch> slides;
-	status = GetObject(presentation, L"Slides", slides);
-	if (!status.ok())
-		return status;
-	long slideCount = 0;
-	status = GetInteger(slides, L"Count", slideCount);
-	if (!status.ok())
-		return status;
-	if (slideIndex > slideCount)
-		return ErrorStatus(-32602, E_INVALIDARG, "SetSlideTitle",
-			"slideIndex exceeds the active presentation's slide count");
-	ATL::CComVariant index(static_cast<long>(slideIndex));
-	ATL::CComVariant value;
-	status = Invoke(slides, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET, &index, 1, &value);
-	if (!status.ok())
-		return status;
-	ATL::CComPtr<IDispatch> slide;
-	status = ReadObject(value, L"Slides.Item", slide, -32000);
-	if (!status.ok())
-		return status;
-	return PutSlideTitle(slide, titleText);
+	if (force)
+		return {};
+	for (long index = 1; index <= count; ++index)
+	{
+		ATL::CComVariant itemIndex(index), value;
+		status = Invoke(presentations, L"Item", DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+			&itemIndex, 1, &value);
+		if (!status.ok())
+			return status;
+		ATL::CComPtr<IDispatch> presentation;
+		status = ReadObject(value, L"Presentations.Item", presentation, -32000);
+		if (!status.ok())
+			return status;
+		long saved = 0;
+		status = GetInteger(presentation, L"Saved", saved);
+		if (!status.ok())
+			return status;
+		std::string path;
+		status = GetString(presentation, L"Path", path);
+		if (!status.ok())
+			return status;
+		if (saved != -1 || path.empty())
+			return ErrorStatus(-32005, HRESULT_FROM_WIN32(ERROR_CANCELLED),
+				"Shutting down PowerPoint", "An open presentation has unsaved changes or no saved path");
+	}
+	return {};
 }

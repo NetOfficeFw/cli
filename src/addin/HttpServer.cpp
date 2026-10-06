@@ -5,6 +5,7 @@
 #include <civetweb.h>
 #include <nlohmann/json.hpp>
 
+#include <climits>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -111,7 +112,14 @@ namespace
 		return Json{{"error", {{"code", code}, {"message", message}}}};
 	}
 
-	enum class Endpoint { Unknown, Rpc, WebSocket, Version, List, New, Activate, Close };
+	enum class Endpoint
+	{
+		Unknown, Rpc, WebSocket, Version, List, New, NamedNew, Activate, Close,
+		Presentation, Slides, Slide, View, SlideShow, AddSlide, AddShape,
+		SetShapeText, DeleteShape, DeleteSlide, SetCurrentSlide, StartSlideShow,
+		StopSlideShow, NavigateSlideShow, Command
+	};
+	using CommandInfo = AutomationDispatcher::CommandInfo;
 
 	std::string_view RequestPath(const mg_request_info &request)
 	{
@@ -120,22 +128,207 @@ namespace
 		return request.local_uri_raw == nullptr ? std::string_view() : request.local_uri_raw;
 	}
 
-	Endpoint IdentifyEndpoint(std::string_view path)
+	// Prefer the row whose verb matches; otherwise return a same-route row so the
+	// caller reports 405 with that row's Allow verb.
+	const CommandInfo *FindCommandRoute(std::initializer_list<CommandScope> scopes,
+		std::string_view suffix, std::string_view method)
+	{
+		const CommandInfo *fallback = nullptr;
+		for (const auto &info : AutomationDispatcher::Commands())
+		{
+			if (std::find(scopes.begin(), scopes.end(), info.scope) == scopes.end() || suffix != info.suffix)
+				continue;
+			if (method == info.verb)
+				return &info;
+			if (fallback == nullptr)
+				fallback = &info;
+		}
+		return fallback;
+	}
+
+	bool IdentifyPresentationEndpoint(std::string_view path, std::string_view method,
+		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId,
+		const CommandInfo *&command, bool &master, long &customLayout);
+	Endpoint IdentifyEndpoint(std::string_view path, std::string_view method,
+		const CommandInfo **command = nullptr)
 	{
 		if (path == "/json/rpc") return Endpoint::Rpc;
 		if (path == "/devtools/application") return Endpoint::WebSocket;
 		if (path == "/json/version") return Endpoint::Version;
 		if (path == "/json" || path == "/json/list") return Endpoint::List;
-		if (path == "/json/new") return Endpoint::New;
+		if (path == "/json/new") return method == "POST" ? Endpoint::NamedNew : Endpoint::New;
 		if (path == "/json/activate" || path.substr(0, 15) == "/json/activate/") return Endpoint::Activate;
 		if (path == "/json/close" || path.substr(0, 12) == "/json/close/") return Endpoint::Close;
-		return Endpoint::Unknown;
+		const CommandInfo *info = nullptr;
+		if (path.substr(0, 6) == "/json/" && path.find('/', 6) == std::string_view::npos)
+			info = FindCommandRoute({ CommandScope::Application }, path.substr(6), method);
+		Endpoint endpoint = Endpoint::Unknown;
+		long slideId = 0, shapeId = 0, customLayout = 0;
+		bool master = false;
+		if (info != nullptr)
+			endpoint = Endpoint::Command;
+		else if (!IdentifyPresentationEndpoint(path, method, endpoint, nullptr, slideId, shapeId, info,
+			master, customLayout))
+			return Endpoint::Unknown;
+		if (command != nullptr)
+			*command = info;
+		return endpoint;
+	}
+
+	bool ParsePositivePathId(std::string_view text, long &value)
+	{
+		value = 0;
+		if (text.empty())
+			return false;
+		unsigned long parsed = 0;
+		for (char digit : text)
+		{
+			if (digit < '0' || digit > '9' || parsed > (static_cast<unsigned long>(INT_MAX) -
+				static_cast<unsigned long>(digit - '0')) / 10)
+				return false;
+			parsed = parsed * 10 + static_cast<unsigned long>(digit - '0');
+		}
+		if (parsed == 0)
+			return false;
+		value = static_cast<long>(parsed);
+		return true;
+	}
+
+	// Routes below a slide (slides/{id}/...) or the slide master (master/...).
+	bool IdentifyContainerEndpoint(std::string_view path, std::string_view method,
+		std::initializer_list<CommandScope> scopes, Endpoint &endpoint, long &shapeId,
+		const CommandInfo *&command)
+	{
+		if (path == "shapes")
+		{
+			endpoint = Endpoint::AddShape;
+			return true;
+		}
+		if (path.substr(0, 7) == "shapes/")
+		{
+			path.remove_prefix(7);
+			const size_t next = path.find('/');
+			ParsePositivePathId(path.substr(0, next), shapeId);
+			if (next == std::string_view::npos)
+			{
+				if (method == "GET")
+				{
+					command = FindCommandRoute({ CommandScope::Shape }, "", method);
+					endpoint = Endpoint::Command;
+				}
+				else
+					endpoint = method == "DELETE" ? Endpoint::DeleteShape : Endpoint::SetShapeText;
+				return true;
+			}
+			command = FindCommandRoute({ CommandScope::Shape }, path.substr(next + 1), method);
+		}
+		else
+			command = FindCommandRoute(scopes, path, method);
+		if (command == nullptr)
+			return false;
+		endpoint = Endpoint::Command;
+		return true;
+	}
+
+	bool IdentifyPresentationEndpoint(std::string_view path, std::string_view method,
+		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId,
+		const CommandInfo *&command, bool &master, long &customLayout)
+	{
+		constexpr std::string_view prefix = "/json/";
+		if (path.substr(0, prefix.size()) != prefix)
+			return false;
+		path.remove_prefix(prefix.size());
+		size_t separator = path.find('/');
+		std::string_view targetView = path.substr(0, separator);
+		if (targetView.empty() || separator == std::string_view::npos)
+			return false;
+		if (target != nullptr)
+			target->assign(targetView);
+		path.remove_prefix(separator + 1);
+		command = nullptr;
+		master = false;
+		customLayout = 0;
+		if (path == "presentation")
+		{
+			endpoint = Endpoint::Presentation;
+			return true;
+		}
+		if (path == "slides")
+		{
+			endpoint = method == "POST" ? Endpoint::AddSlide : Endpoint::Slides;
+			return true;
+		}
+		if (path.substr(0, 7) == "slides/")
+		{
+			path.remove_prefix(7);
+			size_t next = path.find('/');
+			std::string_view slidePart = path.substr(0, next);
+			ParsePositivePathId(slidePart, slideId);
+			if (next == std::string_view::npos)
+			{
+				endpoint = method == "DELETE" ? Endpoint::DeleteSlide : Endpoint::Slide;
+				return true;
+			}
+			if (next + 1 == path.size())
+				return false;
+			return IdentifyContainerEndpoint(path.substr(next + 1), method,
+				{ CommandScope::Slide, CommandScope::Container }, endpoint, shapeId, command);
+		}
+		if (path.substr(0, 7) == "master/" && path.size() > 7)
+		{
+			master = true;
+			return IdentifyContainerEndpoint(path.substr(7), method,
+				{ CommandScope::Container }, endpoint, shapeId, command);
+		}
+		if (path.substr(0, 8) == "layouts/")
+		{
+			// layouts/{index} reads the layout; layouts/{index}/... edits it like a slide or the master.
+			path.remove_prefix(8);
+			const size_t next = path.find('/');
+			ParsePositivePathId(path.substr(0, next), customLayout);
+			if (customLayout == 0)
+				return false;
+			if (next != std::string_view::npos && next + 1 == path.size())
+				return false;
+			return IdentifyContainerEndpoint(next == std::string_view::npos ? std::string_view() :
+				path.substr(next + 1), method, { CommandScope::Container }, endpoint, shapeId, command);
+		}
+		if (path == "view")
+		{
+			endpoint = method == "PUT" ? Endpoint::SetCurrentSlide : Endpoint::View;
+			return true;
+		}
+		if (path == "slide-show")
+		{
+			endpoint = method == "POST" ? Endpoint::StartSlideShow :
+				(method == "DELETE" ? Endpoint::StopSlideShow : Endpoint::SlideShow);
+			return true;
+		}
+		if (path == "slide-show/navigation")
+		{
+			endpoint = Endpoint::NavigateSlideShow;
+			return true;
+		}
+		command = FindCommandRoute({ CommandScope::Target }, path, method);
+		if (command == nullptr)
+			return false;
+		endpoint = Endpoint::Command;
+		return true;
 	}
 
 	const char *EndpointMethod(Endpoint endpoint)
 	{
-		if (endpoint == Endpoint::Rpc) return "POST";
-		if (endpoint == Endpoint::New || endpoint == Endpoint::Activate || endpoint == Endpoint::Close) return "PUT";
+		if (endpoint == Endpoint::Rpc || endpoint == Endpoint::NamedNew ||
+			endpoint == Endpoint::AddSlide || endpoint == Endpoint::AddShape ||
+			endpoint == Endpoint::StartSlideShow ||
+			endpoint == Endpoint::NavigateSlideShow) return "POST";
+		if (endpoint == Endpoint::New || endpoint == Endpoint::Activate ||
+			endpoint == Endpoint::Close || endpoint == Endpoint::SetCurrentSlide ||
+			endpoint == Endpoint::SetShapeText) return "PUT";
+		if (endpoint == Endpoint::DeleteSlide || endpoint == Endpoint::DeleteShape ||
+			endpoint == Endpoint::StopSlideShow) return "DELETE";
+		if (endpoint == Endpoint::Slides || endpoint == Endpoint::Slide ||
+			endpoint == Endpoint::View || endpoint == Endpoint::SlideShow) return "GET";
 		return "GET";
 	}
 
@@ -235,7 +428,8 @@ namespace
 
 	int ProtocolError(mg_connection *connection, int status, const char *message, const char *allow = nullptr)
 	{
-		const bool rpc = IdentifyEndpoint(RequestPath(*mg_get_request_info(connection))) == Endpoint::Rpc;
+		const auto &request = *mg_get_request_info(connection);
+		const bool rpc = IdentifyEndpoint(RequestPath(request), request.request_method) == Endpoint::Rpc;
 		return SendHttp(connection, status,
 			(rpc ? ErrorReply(nullptr, -32600, message) : HttpErrorReply(-32600, message)).dump(), allow);
 	}
@@ -523,12 +717,13 @@ struct HttpServer::State
 				return ProtocolError(connection, 403, "Only the selected IPv4 loopback endpoint is allowed");
 			if (!AllowedOrigin(request, state.port))
 				return ProtocolError(connection, 403, "Origin is not local to this endpoint");
-			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request));
+			const CommandInfo *command = nullptr;
+			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request), request.request_method, &command);
 			const bool websocket = endpoint == Endpoint::WebSocket;
 			if (endpoint == Endpoint::Unknown) return ProtocolError(connection, 404, "Unknown endpoint");
-			const char *method = EndpointMethod(endpoint);
-			if (std::string_view(request.request_method) != method)
-				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint", method);
+			const char *allowed = command != nullptr ? command->verb : EndpointMethod(endpoint);
+			if (std::string_view(request.request_method) != allowed)
+				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint", allowed);
 			if (websocket)
 			{
 				if (std::string_view(request.http_version) != "1.1" ||
@@ -572,7 +767,16 @@ struct HttpServer::State
 	{
 		const auto &request = *mg_get_request_info(connection);
 		std::string_view path = RequestPath(request);
-		const Endpoint endpoint = IdentifyEndpoint(path);
+		std::string target;
+		long slideId = 0, shapeId = 0;
+		Endpoint endpoint = Endpoint::Unknown;
+		const CommandInfo *commandInfo = nullptr;
+		bool master = false;
+		long customLayout = 0;
+		const bool stateRoute = IdentifyPresentationEndpoint(path, request.request_method,
+			endpoint, &target, slideId, shapeId, commandInfo, master, customLayout);
+		if (!stateRoute)
+			endpoint = IdentifyEndpoint(path, request.request_method, &commandInfo);
 		if (endpoint == Endpoint::Rpc)
 		{
 			auto session = Find(connection);
@@ -611,20 +815,83 @@ struct HttpServer::State
 		if (!ParseHttpQuery(request.query_string, argument, force, queryError))
 			return SendHttp(connection, 400, HttpErrorReply(-32602, queryError).dump());
 		AutomationDispatcher::HttpCommand command;
-		switch (endpoint)
+		if (stateRoute)
 		{
-		case Endpoint::Version: command = AutomationDispatcher::HttpCommand::Version; argument.clear(); break;
-		case Endpoint::List: command = AutomationDispatcher::HttpCommand::List; argument.clear(); break;
-		case Endpoint::New: command = AutomationDispatcher::HttpCommand::New; break;
-		case Endpoint::Activate:
-			command = AutomationDispatcher::HttpCommand::Activate;
-			argument = path.size() > 15 ? std::string(path.substr(15)) : "";
-			break;
-		case Endpoint::Close:
-			command = AutomationDispatcher::HttpCommand::Close;
-			argument = path.size() > 12 ? std::string(path.substr(12)) : "";
-			break;
-		default: return ProtocolError(connection, 404, "Unknown endpoint");
+			argument = std::move(target);
+			switch (endpoint)
+			{
+			case Endpoint::Presentation: command = AutomationDispatcher::HttpCommand::Presentation; break;
+			case Endpoint::Slides: command = AutomationDispatcher::HttpCommand::Slides; break;
+			case Endpoint::Slide: command = AutomationDispatcher::HttpCommand::Slide; break;
+			case Endpoint::View: command = AutomationDispatcher::HttpCommand::View; break;
+			case Endpoint::SlideShow: command = AutomationDispatcher::HttpCommand::SlideShow; break;
+			case Endpoint::AddSlide: command = AutomationDispatcher::HttpCommand::AddSlide; break;
+			case Endpoint::AddShape: command = AutomationDispatcher::HttpCommand::AddShape; break;
+			case Endpoint::SetShapeText: command = AutomationDispatcher::HttpCommand::SetShapeText; break;
+			case Endpoint::DeleteShape: command = AutomationDispatcher::HttpCommand::DeleteShape; break;
+			case Endpoint::DeleteSlide: command = AutomationDispatcher::HttpCommand::DeleteSlide; break;
+			case Endpoint::SetCurrentSlide: command = AutomationDispatcher::HttpCommand::SetCurrentSlide; break;
+			case Endpoint::StartSlideShow: command = AutomationDispatcher::HttpCommand::StartSlideShow; break;
+			case Endpoint::StopSlideShow: command = AutomationDispatcher::HttpCommand::StopSlideShow; break;
+			case Endpoint::NavigateSlideShow: command = AutomationDispatcher::HttpCommand::NavigateSlideShow; break;
+			case Endpoint::Command: command = commandInfo->command; break;
+			default: return ProtocolError(connection, 404, "Unknown endpoint");
+			}
+		}
+		else
+		{
+			switch (endpoint)
+			{
+			case Endpoint::Version: command = AutomationDispatcher::HttpCommand::Version; argument.clear(); break;
+			case Endpoint::List: command = AutomationDispatcher::HttpCommand::List; argument.clear(); break;
+			case Endpoint::New: command = AutomationDispatcher::HttpCommand::New; break;
+			case Endpoint::NamedNew: command = AutomationDispatcher::HttpCommand::NamedNew; argument.clear(); break;
+			case Endpoint::Activate:
+				command = AutomationDispatcher::HttpCommand::Activate;
+				argument = path.size() > 15 ? std::string(path.substr(15)) : "";
+				break;
+			case Endpoint::Close:
+				command = AutomationDispatcher::HttpCommand::Close;
+				argument = path.size() > 12 ? std::string(path.substr(12)) : "";
+				break;
+			case Endpoint::Command: command = commandInfo->command; argument.clear(); break;
+			default: return ProtocolError(connection, 404, "Unknown endpoint");
+			}
+		}
+		Json parameters = Json::object();
+		const bool needsBody = endpoint == Endpoint::NamedNew || endpoint == Endpoint::AddSlide ||
+			endpoint == Endpoint::AddShape || endpoint == Endpoint::SetShapeText ||
+			endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow ||
+			(endpoint == Endpoint::Command && std::string_view(commandInfo->verb) != "GET");
+		if (needsBody)
+		{
+			std::string_view contentType = Header(connection, "Content-Type");
+			if (!EqualAscii(Trim(contentType.substr(0, contentType.find(';'))), "application/json"))
+				return ProtocolError(connection, 415, "Content-Type must be application/json");
+			if (request.content_length > static_cast<long long>(MaxMessageBytes))
+				return ProtocolError(connection, 413, "Request exceeds the 1 MiB limit");
+			std::string body;
+			if (request.content_length > 0)
+				body.reserve(static_cast<size_t>(request.content_length));
+			std::array<char, 16 * 1024> buffer{};
+			for (;;)
+			{
+				if (session->cancelled->load())
+					return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
+				int bytes = mg_read(connection, buffer.data(), buffer.size());
+				if (bytes < 0)
+					return ProtocolError(connection, 400, "Unable to read the request body");
+				if (bytes == 0)
+					break;
+				if (static_cast<size_t>(bytes) > MaxMessageBytes - body.size())
+					return ProtocolError(connection, 413, "Request exceeds the 1 MiB limit");
+				body.append(buffer.data(), static_cast<size_t>(bytes));
+			}
+			if (request.content_length >= 0 && body.size() != static_cast<size_t>(request.content_length))
+				return ProtocolError(connection, 400, "Incomplete request body");
+			parameters = Json::parse(body, nullptr, false);
+			if (parameters.is_discarded() || !parameters.is_object())
+				return ProtocolError(connection, 400, "Request body must be a JSON object");
 		}
 		if ((endpoint == Endpoint::Activate || endpoint == Endpoint::Close) && !argument.empty())
 		{
@@ -638,7 +905,32 @@ struct HttpServer::State
 			if (argument.find('\0') != std::string::npos)
 				return SendHttp(connection, 400, HttpErrorReply(-32602, "Target must not contain a NUL character").dump());
 		}
-		Json envelope = dispatcher->HandleHttpRequest(command, argument, endpoint == Endpoint::Close && force, session->cancelled);
+		// The route alone selects a slide, the master, or a layout; never trust a body member for it.
+		// (On slide creation, customLayout instead names the new slide's layout.)
+		parameters.erase("master");
+		if (master)
+			parameters["master"] = true;
+		if (endpoint != Endpoint::AddSlide)
+			parameters.erase("customLayout");
+		if (customLayout > 0)
+			parameters["customLayout"] = customLayout;
+		if ((endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow) &&
+			parameters.contains("slideId"))
+		{
+			const auto &value = parameters["slideId"];
+			if (value.is_number_unsigned())
+			{
+				uint64_t parsed = value.get<uint64_t>();
+				if (parsed > 0 && parsed <= INT_MAX) slideId = static_cast<long>(parsed);
+			}
+			else if (value.is_number_integer())
+			{
+				int64_t parsed = value.get<int64_t>();
+				if (parsed > 0 && parsed <= INT_MAX) slideId = static_cast<long>(parsed);
+			}
+		}
+		Json envelope = dispatcher->HandleHttpRequest(command, argument, slideId, shapeId,
+			endpoint == Endpoint::Close && force, parameters, session->cancelled);
 		if (session->cancelled->load())
 			return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
 		int status = 200;

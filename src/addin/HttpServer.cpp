@@ -114,7 +114,7 @@ namespace
 
 	enum class Endpoint
 	{
-		Unknown, Rpc, WebSocket, Version, List, New, Activate, Close,
+		Unknown, Rpc, WebSocket, Version, List, New, NamedNew, Activate, Close,
 		Presentation, Slides, Slide, View, SlideShow, AddSlide, AddShape,
 		SetShapeText, DeleteShape, DeleteSlide, SetCurrentSlide, StartSlideShow,
 		StopSlideShow, NavigateSlideShow
@@ -135,7 +135,7 @@ namespace
 		if (path == "/devtools/application") return Endpoint::WebSocket;
 		if (path == "/json/version") return Endpoint::Version;
 		if (path == "/json" || path == "/json/list") return Endpoint::List;
-		if (path == "/json/new") return Endpoint::New;
+		if (path == "/json/new") return method == "POST" ? Endpoint::NamedNew : Endpoint::New;
 		if (path == "/json/activate" || path.substr(0, 15) == "/json/activate/") return Endpoint::Activate;
 		if (path == "/json/close" || path.substr(0, 12) == "/json/close/") return Endpoint::Close;
 		Endpoint endpoint = Endpoint::Unknown;
@@ -235,8 +235,9 @@ namespace
 
 	const char *EndpointMethod(Endpoint endpoint)
 	{
-		if (endpoint == Endpoint::Rpc || endpoint == Endpoint::AddSlide ||
-			endpoint == Endpoint::AddShape || endpoint == Endpoint::StartSlideShow ||
+		if (endpoint == Endpoint::Rpc || endpoint == Endpoint::NamedNew ||
+			endpoint == Endpoint::AddSlide || endpoint == Endpoint::AddShape ||
+			endpoint == Endpoint::StartSlideShow ||
 			endpoint == Endpoint::NavigateSlideShow) return "POST";
 		if (endpoint == Endpoint::New || endpoint == Endpoint::Activate ||
 			endpoint == Endpoint::Close || endpoint == Endpoint::SetCurrentSlide ||
@@ -756,6 +757,7 @@ struct HttpServer::State
 			case Endpoint::Version: command = AutomationDispatcher::HttpCommand::Version; argument.clear(); break;
 			case Endpoint::List: command = AutomationDispatcher::HttpCommand::List; argument.clear(); break;
 			case Endpoint::New: command = AutomationDispatcher::HttpCommand::New; break;
+			case Endpoint::NamedNew: command = AutomationDispatcher::HttpCommand::NamedNew; argument.clear(); break;
 			case Endpoint::Activate:
 				command = AutomationDispatcher::HttpCommand::Activate;
 				argument = path.size() > 15 ? std::string(path.substr(15)) : "";
@@ -768,9 +770,9 @@ struct HttpServer::State
 			}
 		}
 		Json parameters = Json::object();
-		const bool needsBody = endpoint == Endpoint::AddSlide || endpoint == Endpoint::AddShape ||
-			endpoint == Endpoint::SetShapeText || endpoint == Endpoint::SetCurrentSlide ||
-			endpoint == Endpoint::NavigateSlideShow;
+		const bool needsBody = endpoint == Endpoint::NamedNew || endpoint == Endpoint::AddSlide ||
+			endpoint == Endpoint::AddShape || endpoint == Endpoint::SetShapeText ||
+			endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow;
 		if (needsBody)
 		{
 			std::string_view contentType = Header(connection, "Content-Type");

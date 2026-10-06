@@ -8,7 +8,11 @@
   "files": ["bin", "lib"],
   "engines": { "node": ">=20" },
   "scripts": {
-    "test:state-api": "node --test test/state-api.test.js"
+    "test:state-api": "node --test test/state-api.test.js",
+    "test:cli": "node --test test/cli-arguments.test.js",
+    "test:named": "node --test test/named-presentation.test.js",
+    "test:close": "node --test test/presentation-close.test.js",
+    "test:shutdown": "node --test test/shutdown.test.js"
   },
   "dependencies": {
     "ws": "^8.18.3"

@@ -18,7 +18,7 @@ class AutomationDispatcher : public std::enable_shared_from_this<AutomationDispa
 public:
 	AutomationDispatcher() = default;
 	enum class HttpCommand {
-		Version, List, New, Activate, Close, Presentation, Slides, Slide, View, SlideShow,
+		Version, List, New, NamedNew, Activate, Close, Presentation, Slides, Slide, View, SlideShow,
 		AddSlide, AddShape, SetShapeText, DeleteShape, DeleteSlide, SetCurrentSlide,
 		StartSlideShow, StopSlideShow, NavigateSlideShow
 	};
@@ -79,9 +79,9 @@ private:
 	Status ActivateDocument(IDispatch *document);
 	Status GetString(IDispatch *object, const wchar_t *name, std::string &result);
 	Status GetExecutableBuild(IDispatch *application, std::string &result);
-	Status CreatePresentation(const std::string &title, nlohmann::json &result);
-	Status UpdateSlideTitle(int slideIndex, const std::string &text);
-	Status PutSlideTitle(IDispatch *slide, ATL::CComVariant &text);
+	Status CreatePresentation(const std::string &name, const std::string &directory,
+		nlohmann::json &result);
+	Status ValidateShutdown(bool force);
 	Status Invoke(IDispatch *object, const wchar_t *name, WORD flags,
 		ATL::CComVariant *arguments, UINT argumentCount, ATL::CComVariant *result,
 		int failureCode = -32000);

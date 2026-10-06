@@ -5,7 +5,7 @@ const { parseArguments, usage } = require('../lib/arguments');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
-// Fixed script: no command-line title or other user text is evaluated by PowerShell.
+// Fixed script: no user-supplied text is evaluated by PowerShell.
 const launchScript = `
 $ErrorActionPreference = 'Stop'
 $paths = @(
@@ -31,6 +31,26 @@ try {
 }
 `;
 
+// The add-in acknowledges the unsaved-document preflight before this separate
+// process requests Quit; quitting from inside its own STA callback stalls Office.
+const shutdownScript = `
+$ErrorActionPreference = 'Stop'
+$running = @(Get-Process POWERPNT)
+if ($running.Count -ne 1 -or $running[0].Id -ne [int]$env:NETOFFICE_EXPECTED_PID) {
+  throw 'PowerPoint process identity is ambiguous or differs from the add-in process.'
+}
+$app = [Runtime.InteropServices.Marshal]::GetActiveObject('PowerPoint.Application')
+foreach ($presentation in @($app.Presentations)) {
+  if ($env:NETOFFICE_FORCE -eq '1') {
+    $presentation.Saved = -1
+    $presentation.Close()
+  } elseif ($presentation.Saved -ne -1 -or [string]::IsNullOrEmpty($presentation.Path)) {
+    throw 'An open presentation has unsaved changes or no saved path.'
+  }
+}
+$app.Quit()
+`;
+
 function launchPowerPoint(deadline) {
   return new Promise((resolve, reject) => {
     const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
@@ -45,11 +65,26 @@ function launchPowerPoint(deadline) {
   });
 }
 
+function quitPowerPoint(processId, deadline, force) {
+  return new Promise((resolve, reject) => {
+    const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    execFile(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', shutdownScript], {
+      windowsHide: true,
+      timeout: Math.max(1, deadline - Date.now()),
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, NETOFFICE_EXPECTED_PID: String(processId), NETOFFICE_FORCE: force ? '1' : '0' }
+    }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`Unable to shut down PowerPoint: ${stderr.trim() || error.message}`));
+      else resolve();
+    });
+  });
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) { process.stdout.write(usage); return; }
-  if (options.command === 'powerpoint launch' && process.platform !== 'win32') {
-    throw new Error('powerpoint launch is supported only on Windows with desktop Microsoft PowerPoint installed.');
+  if (options.command.startsWith('powerpoint ') && process.platform !== 'win32') {
+    throw new Error(`${options.command} is supported only on Windows with desktop Microsoft PowerPoint installed.`);
   }
   const { Connection, deadlineError, retryable } = require('../lib/connection');
   const endpoint = `ws://127.0.0.1:${options.port}/devtools/application`;
@@ -95,15 +130,47 @@ async function main() {
       console.log(`PowerPoint ready (PID ${reply.processId}).`);
     } else {
       await ready(false);
-      if (options.command === 'presentation new') {
-        const reply = await client.request('PowerPoint.newPresentation', { title: options.title }, deadline);
-        if (typeof reply.name !== 'string' || !Number.isSafeInteger(reply.slideCount) || reply.slideCount < 0) {
-          throw new Error('Invalid server response: expected presentation name and slideCount. The presentation may already have been created; the command was not retried.');
+      if (options.command === 'powerpoint shutdown') {
+        const { processId } = await status(deadline);
+        await client.request(options.method, options.params, deadline);
+        client.close();
+        client = undefined;
+        await quitPowerPoint(processId, deadline, options.force === true);
+        while (Date.now() < deadline) {
+          try {
+            process.kill(processId, 0);
+          } catch (error) {
+            if (error.code === 'ESRCH') {
+              console.log(JSON.stringify({ processId, stopped: true }));
+              return;
+            }
+            throw error;
+          }
+          await new Promise(resolve => setTimeout(resolve, Math.min(100, deadline - Date.now())));
         }
-        console.log(`Created presentation ${JSON.stringify(reply.name)} (${reply.slideCount} slide${reply.slideCount === 1 ? '' : 's'}).`);
+        throw new Error(`PowerPoint (PID ${processId}) did not exit before the deadline.`);
+      } else if (options.command === 'presentation new') {
+        const destination = path.parse(path.resolve(options.path));
+        const reply = await client.request('PowerPoint.newPresentation', {
+          name: destination.base, directory: destination.dir
+        }, deadline);
+        if (typeof reply.name !== 'string' || !Number.isSafeInteger(reply.slideCount) ||
+            reply.slideCount !== 0 || typeof reply.url !== 'string' || typeof reply.id !== 'string') {
+          throw new Error('Invalid server response: presentation may already have been created; command was not retried.');
+        }
+        console.log(JSON.stringify(reply));
+      } else if (options.command === 'presentation open') {
+        const reply = await client.request(options.method, { path: path.resolve(options.path) }, deadline);
+        console.log(JSON.stringify(reply));
+      } else if (options.command === 'presentation list') {
+        const response = await fetch(`http://127.0.0.1:${options.port}/json/list`, {
+          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now()))
+        });
+        if (!response.ok) throw new Error(`Unable to list presentations (HTTP ${response.status}).`);
+        console.log(JSON.stringify(await response.json()));
       } else {
-        await client.request('PowerPoint.setSlideTitle', { slideIndex: options.slide, text: options.title }, deadline);
-        console.log(`Updated slide ${options.slide} title to ${JSON.stringify(options.title)}.`);
+        const reply = await client.request(options.method, options.params, deadline);
+        console.log(JSON.stringify(reply));
       }
     }
   } catch (error) {

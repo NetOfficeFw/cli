@@ -27,7 +27,7 @@ These target-scoped endpoints inspect and mutate the live PowerPoint object mode
 
 Mutation requests with bodies require `Content-Type: application/json` and a JSON object. Slide creation accepts optional `layout` from `1` through `12`, defaulting to PowerPoint's blank layout (`12`). Its result is `{ "id", "slideId", "slideIndex" }`.
 
-Shape creation requires numeric `shapeType` (`1..255`), finite `left` and `top`, and positive `width` and `height`; optional `text` initializes its plain text. `shapeType` is a PowerPoint `MsoAutoShapeType` numeric value. Creation returns `{ "id", "slideId", "shapeId" }`. Text replacement requires a string `text` and replaces all existing plain text; it fails if the shape has no writable text frame. Delete results include `deleted: true`.
+Shape creation requires numeric `shapeType` (`1..255`), finite `left` and `top`, and positive `width` and `height`. `shapeType` is a PowerPoint `MsoAutoShapeType` numeric value. Creation returns `{ "id", "slideId", "shapeId" }` without changing text. Text replacement is a separate request requiring a string `text`; it replaces all existing plain text and fails if the shape has no writable text frame. Delete results include `deleted: true`.
 
 Set the editing slide with `PUT /view` and `{ "slideId": 259 }`. The first document window for that presentation receives the change. Start runs the presentation's slide show; stop exits all matching show windows. Navigation takes `{ "action": "next" }`, `{ "action": "previous" }`, or `{ "action": "goto", "slideId": 259 }`. `goto` resolves the stable ID to the current slide index. Navigation applies to each running show window for the requested presentation; controlling a show that is not running returns `-32001`.
 
@@ -37,13 +37,15 @@ The same reads and mutations are available on `/devtools/application` using the 
 
 | Method | Parameters |
 |---|---|
+| `PowerPoint.openPresentation` | `{ "path": "C:\\Documents\\Existing.pptx" }` |
 | `PowerPoint.getPresentationState` | `{ "targetId": "<target>" }` |
+| `PowerPoint.closePresentation` | `{ "targetId": "<target>", "force": true }` (`force` optional; defaults to `false`) |
 | `PowerPoint.getSlides` | `{ "targetId": "<target>" }` |
 | `PowerPoint.getSlideState` | `{ "targetId": "<target>", "slideId": 259 }` |
 | `PowerPoint.getViewState` | `{ "targetId": "<target>" }` |
 | `PowerPoint.getSlideShowState` | `{ "targetId": "<target>" }` |
 | `PowerPoint.addSlide` | `{ "targetId": "<target>", "layout": 12 }` |
-| `PowerPoint.createShape` | `{ "targetId": "<target>", "slideId": 259, "shapeType": 1, "left": 24, "top": 36, "width": 160, "height": 48, "text": "Example" }` |
+| `PowerPoint.createShape` | `{ "targetId": "<target>", "slideId": 259, "shapeType": 1, "left": 24, "top": 36, "width": 160, "height": 48 }` |
 | `PowerPoint.setShapeText` | `{ "targetId": "<target>", "slideId": 259, "shapeId": 7, "text": "Updated" }` |
 | `PowerPoint.deleteShape` | `{ "targetId": "<target>", "slideId": 259, "shapeId": 7 }` |
 | `PowerPoint.deleteSlide` | `{ "targetId": "<target>", "slideId": 259 }` |
@@ -52,7 +54,9 @@ The same reads and mutations are available on `/devtools/application` using the 
 | `PowerPoint.stopSlideShow` | `{ "targetId": "<target>" }` |
 | `PowerPoint.navigateSlideShow` | `{ "targetId": "<target>", "action": "goto", "slideId": 259 }` |
 
-`targetId` must be a canonical target GUID. `slideId` and `shapeId` must be positive int32 identifiers. Invalid parameters return `-32602`; an unknown/closed target, slide, or shape returns `-32004`. The WebSocket result has the same JSON shape as the corresponding HTTP response body. WebSocket is preferred for mutations because CivetWeb cannot detect an HTTP disconnect while its handler waits for PowerPoint's STA; an abandoned HTTP mutation may still execute until its queue deadline.
+`targetId` must be a canonical target GUID for target-scoped methods; `openPresentation` instead requires a non-empty path and returns the opened document descriptor. `slideId` and `shapeId` must be positive int32 identifiers. Invalid parameters return `-32602`; an unknown/closed target, slide, or shape returns `-32004`. The WebSocket result has the same JSON shape as the corresponding HTTP response body. WebSocket is preferred for mutations because CivetWeb cannot detect an HTTP disconnect while its handler waits for PowerPoint's STA; an abandoned HTTP mutation may still execute until its queue deadline.
+
+`PowerPoint.closePresentation` closes only its `targetId`. An unsaved presentation returns `-32005` unless `force` is `true`, which discards its edits; other presentations and the PowerPoint process remain open.
 
 Speaker notes are intentionally not included.
 
@@ -168,4 +172,4 @@ The implementation enumerates `Application.SlideShowWindows`, associates each sh
 
 ## Consistency and implementation limits
 
-These are live COM reads and mutations, not snapshots parsed from the `.pptx` package. Presentation IDs keep every request scoped to one open document. View/selection/show state is transient and may change between calls, so responses are best-effort point-in-time reads, not a transactionally consistent snapshot. Calls must stay on PowerPoint's owning STA. Mutations remain unsaved until PowerPoint saves; responses are subject to the server's existing 1 MiB message limit. The current CLI does not expose these methods; callers use HTTP or WebSocket directly.
+These are live COM reads and mutations, not snapshots parsed from the `.pptx` package. Presentation IDs keep every request scoped to one open document. View/selection/show state is transient and may change between calls, so responses are best-effort point-in-time reads, not a transactionally consistent snapshot. Calls must stay on PowerPoint's owning STA. Mutations remain unsaved until PowerPoint saves; responses are subject to the server's existing 1 MiB message limit. The `netoffice` CLI exposes every read and mutation as a subcommand using the same WebSocket methods; `netoffice presentation list` discovers target IDs via `/json/list`.

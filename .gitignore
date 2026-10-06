@@ -31,3 +31,7 @@ bld/
 node_modules/
 *.tgz
 /src/cli/proto/
+
+# PowerPoint presentations
+*.pptx
+*.ppt

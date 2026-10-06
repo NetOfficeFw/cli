@@ -279,8 +279,9 @@ The new read routes are target-scoped; `{target}` is the opaque ID from `/json/l
 Slide routes use PowerPoint's stable `SlideID`, not the current slide index.
 Responses use camelCase JSON fields. Slide details contain top-level shape
 summaries (`shapeId`, `zOrderPosition`, `name`, numeric `shapeType`, `bounds`,
-and plain `text` or `null`). Rich text, recursive groups, charts, and image
-contents are not represented. View/selection fields are transient and may be
+plain `text` or `null`, and recursive `groupItems` for groups). Rich text is read
+per shape with `shape state`; chart data and image contents are not represented.
+View/selection fields are transient and may be
 unavailable. `slide-show` reports live show windows and their current slides.
 Each call is a best-effort COM read, not a transactionally consistent snapshot.
 
@@ -328,7 +329,75 @@ requires `targetId`; slide and shape methods also require stable `slideId` and,
 where applicable, `shapeId`. For disconnect-sensitive mutations, use WebSocket:
 an abandoned HTTP call may still execute until its queue deadline.
 
+### Design, formatting, and content commands
 
+Each row of `src/addin/PowerPointCommands.h` is one granular command: its
+WebSocket method, HTTP verb, scope, and route suffix. The scope fixes the route
+prefix and the required IDs:
+
+| Scope | Route | Required params |
+| --- | --- | --- |
+| Application | `/json/<suffix>` | none |
+| Target | `/json/{target}/<suffix>` | `targetId` |
+| Slide | `/json/{target}/slides/{slide-id}/<suffix>` | `targetId`, `slideId` |
+| Slide, master, or layout | `…/slides/{slide-id}/<suffix>`, `/json/{target}/master/<suffix>`, or `/json/{target}/layouts/{layout-index}/<suffix>` | `targetId` and exactly one of `slideId`, `master: true`, or `customLayout` |
+| Shape | `…/shapes/{shape-id}/<suffix>` below a slide, the master, or a layout | the above plus `shapeId` |
+
+`customLayout` is the 1-based index from `layout list` (`SlideMaster.CustomLayouts`).
+`shape add`, `shape text`, and `shape delete` also accept the master and layouts
+(`…/master/shapes[/{shape-id}]`, `…/layouts/{layout-index}/shapes[/{shape-id}]`). Mutations use a JSON body (send
+`{}` when there are no members); results contain the routing identity, any new
+IDs, and the accepted parameters. Colors are `"#RRGGBB"`; booleans are JSON
+booleans; paths are absolute. Setters reject requests that set nothing.
+`presentation state` also reports `slideWidth`/`slideHeight`, slide details
+report group members as `groupItems`, and `slide add` accepts `customLayout`
+(an index from `layout list`) or `customLayoutName` (an exact layout name)
+instead of `layout`; its result then includes the resolved `customLayout`.
+
+| CLI | Method | HTTP |
+| --- | --- | --- |
+| `presentation save [--path]` | `savePresentation` | `POST …/presentation/save` |
+| `presentation size` | `setSlideSize` | `PUT …/presentation/page-setup` |
+| `presentation theme` | `applyTheme` | `PUT …/presentation/theme` |
+| `presentation colors` | `setThemeColors` (`colors` object) | `PUT …/presentation/theme/colors` |
+| `presentation fonts` | `setThemeFonts` | `PUT …/presentation/theme/fonts` |
+| `layout list` | `getLayouts` | `GET …/layouts` |
+| `master show` | `getMasterState` | `GET …/master` |
+| `layout show --custom-layout` | `getLayoutState` | `GET …/layouts/{layout-index}` |
+| `slide background` | `setBackground` | `PUT …/background` |
+| `slide footer` | `setHeadersFooters` | `PUT …/headers-footers` |
+| `slide move`, `name`, `notes`, `transition`, `hidden` | `moveSlide`, `setSlideName`, `setSlideNotes`, `setSlideTransition`, `setSlideHidden` | `PUT …/slides/{id}/position`, `name`, `notes`, `transition`, `hidden` |
+| `slide duplicate`, `slide export` | `duplicateSlide`, `exportSlide` | `POST …/slides/{id}/duplicate`, `export` |
+| `shape state` | `getShapeState` | `GET …/shapes/{id}` |
+| `shape fill`, `line`, `shadow`, `glow`, `softedge`, `3d`, `style`, `adjust`, `rotation`, `name`, `bounds`, `zorder` | `setShapeFill`, `setShapeLine`, `setShapeShadow`, `setShapeGlow`, `setShapeSoftEdge`, `setShapeThreeD`, `setShapeStyle`, `setShapeAdjustment`, `setShapeRotation`, `setShapeName`, `setShapeBounds`, `setShapeZOrder` | `PUT …/shapes/{id}/fill`, `line`, `shadow`, `glow`, `soft-edge`, `three-d`, `style`, `adjustments`, `rotation`, `name`, `bounds`, `z-order` |
+| `shape flip`, `duplicate`, `copy-format`, `ungroup`, `animation` | `flipShape`, `duplicateShape`, `copyShapeFormat`, `ungroupShape`, `addAnimation` | `POST …/shapes/{id}/flip`, `duplicate`, `format`, `ungroup`, `animations` |
+| `shape font`, `paragraph`, `textframe` | `setShapeFont`, `setShapeParagraph`, `setShapeTextFrame` | `PUT …/shapes/{id}/text/font`, `text/paragraphs`, `text/frame` |
+| `shape group`, `align`, `distribute` | `groupShapes`, `alignShapes`, `distributeShapes` | `POST …/groups`, `alignment`, `distribution` |
+| `textbox add`, `line add`, `connector add`, `picture add`, `table add`, `chart add`, `smartart add` | `addTextbox`, `addLine`, `addConnector`, `addPicture`, `addTable`, `addChart`, `addSmartArt` | `POST …/textboxes`, `lines`, `connectors`, `pictures`, `tables`, `charts`, `smartart` |
+| `connector connect`, `table cell`, `chart data`, `chart title`, `smartart node` | `connectConnector`, `setTableCell`, `setChartData`, `setChartTitle`, `setSmartArtNode` | `PUT …/shapes/{id}/connections`, `cells`, `chart/data`, `chart/title`, `smartart/nodes` |
+| `smartart layouts` | `getSmartArtLayouts` | `GET /json/smartart-layouts` |
+
+`netoffice --help` lists every option, value, and enum name. For example:
+
+```powershell
+$t = (netoffice presentation open --path .\LifeInCorporation.pptx | ConvertFrom-Json).id
+$s = (netoffice slide add --target $t | ConvertFrom-Json).slideId
+$card = (netoffice shape add --target $t --slide-id $s --type 5 --left 66 --top 232 --width 195 --height 200 | ConvertFrom-Json).shapeId
+netoffice shape fill --target $t --slide-id $s --shape-id $card --color '#FFFFFF'
+netoffice shape shadow --target $t --slide-id $s --shape-id $card --blur 14 --offset-y 4 --transparency 0.85
+netoffice shape text --target $t --slide-id $s --shape-id $card --text "Meetings`nStand-ups and syncs"
+netoffice shape font --target $t --slide-id $s --shape-id $card --start 1 --length 8 --bold true --color '#1F3864'
+netoffice slide export --target $t --slide-id $s --path .\preview.png
+netoffice presentation save --target $t
+```
+
+`netoffice batch run --file steps.json` runs a JSON array of CLI argument
+arrays over one connection, in order, and stops at the first failure. In any
+argument, `$<n>.<field>` becomes that field of the result of step `n`
+(0-based), e.g. `["shape","fill","--target","$0.id","--slide-id","$1.slideId","--shape-id","$2.shapeId","--color","#FFFFFF"]`.
+The whole batch shares one `--timeout`; it prints every result, including the
+completed ones before a failure. `powerpoint` commands and `presentation list`
+cannot run in a batch.
 
 ### Application WebSocket commands
 
@@ -342,7 +411,7 @@ an abandoned HTTP call may still execute until its queue deadline.
 {"id":12,"method":"PowerPoint.openPresentation","params":{"path":"C:\\Documents\\Existing.pptx"}}
 {"id":12,"result":{"id":"a4d083ef-2e42-4c54-a690-f4885097017c","title":"Existing.pptx","url":"C:\\Documents\\Existing.pptx","type":"document"}}
 {"id":5,"method":"PowerPoint.getPresentationState","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064"}}
-{"id":5,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","name":"Quarterly report.pptx","url":"C:\\Documents\\Quarterly report.pptx","saved":true,"readOnly":false,"slideCount":0}}
+{"id":5,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","name":"Quarterly report.pptx","url":"C:\\Documents\\Quarterly report.pptx","saved":true,"readOnly":false,"slideCount":0,"slideWidth":960,"slideHeight":540}}
 
 {"id":3,"method":"PowerPoint.addSlide","params":{"targetId":"d17fd90d-90f8-4a29-b204-49495b78d064","layout":12}}
 {"id":3,"result":{"id":"d17fd90d-90f8-4a29-b204-49495b78d064","slideId":256,"slideIndex":1}}
@@ -411,7 +480,8 @@ The test launches or reuses PowerPoint, creates two named test presentations,
 checks reads and mutations over HTTP and WebSocket, then closes and removes them.
 Run `npm --prefix src/cli run test:named` for live named creation,
 `npm --prefix src/cli run test:close` for targeted close, force, and reopening,
-and `npm --prefix src/cli run test:cli` for offline argument checks.
+`npm --prefix src/cli run test:formatting` for live design, master, and group
+commands, and `npm --prefix src/cli run test:cli` for offline argument checks.
 Run `npm --prefix src/cli run test:shutdown` separately in an isolated
 PowerPoint session to check safe refusal, forced discard, and process exit.
 Set `NETOFFICE_PORT` if the registered add-in uses a non-default port.

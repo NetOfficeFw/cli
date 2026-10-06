@@ -2,6 +2,7 @@
 'use strict';
 
 const { parseArguments, usage } = require('../lib/arguments');
+const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
@@ -113,6 +114,17 @@ async function main() {
     }
     throw deadlineError();
   };
+  // One WebSocket request for a parsed command; mutations are never retried.
+  const send = async parsed => {
+    const params = parsed.command === 'presentation open' ? { path: path.resolve(parsed.path) } : parsed.params;
+    const reply = await client.request(parsed.method, params, deadline);
+    if (parsed.command === 'presentation new' && (typeof reply.name !== 'string' ||
+        !Number.isSafeInteger(reply.slideCount) || reply.slideCount !== 0 ||
+        typeof reply.url !== 'string' || typeof reply.id !== 'string')) {
+      throw new Error('Invalid server response: presentation may already have been created; command was not retried.');
+    }
+    return reply;
+  };
   try {
     if (options.command === 'powerpoint launch') {
       let reply;
@@ -149,28 +161,41 @@ async function main() {
           await new Promise(resolve => setTimeout(resolve, Math.min(100, deadline - Date.now())));
         }
         throw new Error(`PowerPoint (PID ${processId}) did not exit before the deadline.`);
-      } else if (options.command === 'presentation new') {
-        const destination = path.parse(path.resolve(options.path));
-        const reply = await client.request('PowerPoint.newPresentation', {
-          name: destination.base, directory: destination.dir
-        }, deadline);
-        if (typeof reply.name !== 'string' || !Number.isSafeInteger(reply.slideCount) ||
-            reply.slideCount !== 0 || typeof reply.url !== 'string' || typeof reply.id !== 'string') {
-          throw new Error('Invalid server response: presentation may already have been created; command was not retried.');
-        }
-        console.log(JSON.stringify(reply));
-      } else if (options.command === 'presentation open') {
-        const reply = await client.request(options.method, { path: path.resolve(options.path) }, deadline);
-        console.log(JSON.stringify(reply));
       } else if (options.command === 'presentation list') {
         const response = await fetch(`http://127.0.0.1:${options.port}/json/list`, {
           signal: AbortSignal.timeout(Math.max(1, deadline - Date.now()))
         });
         if (!response.ok) throw new Error(`Unable to list presentations (HTTP ${response.status}).`);
         console.log(JSON.stringify(await response.json()));
+      } else if (options.command === 'batch run') {
+        const steps = JSON.parse(fs.readFileSync(path.resolve(options.file), 'utf8'));
+        if (!Array.isArray(steps) || steps.some(step => !Array.isArray(step) || step.some(arg => typeof arg !== 'string'))) {
+          throw new Error('batch run --file requires a JSON array of argument arrays.');
+        }
+        const results = [];
+        for (const [index, step] of steps.entries()) {
+          const args = step.map(arg => arg.replace(/\$(\d+)\.([A-Za-z][A-Za-z0-9]*)/g, (reference, position, field) => {
+            const source = results[Number(position)];
+            if (!source || !Object.hasOwn(source, field)) {
+              throw new Error(`Batch command ${index}: ${reference} does not name a field of an earlier result.`);
+            }
+            return String(source[field]);
+          }));
+          const stepOptions = parseArguments(args);
+          if (!stepOptions.method || stepOptions.command.startsWith('powerpoint ')) {
+            throw new Error(`Batch command ${index}: ${stepOptions.command || args.join(' ')} cannot run in a batch.`);
+          }
+          try {
+            results.push(await send(stepOptions));
+          } catch (error) {
+            console.log(JSON.stringify(results));
+            error.message = `Batch command ${index} (${stepOptions.command}) failed after ${index} completed: ${error.message}`;
+            throw error;
+          }
+        }
+        console.log(JSON.stringify(results));
       } else {
-        const reply = await client.request(options.method, options.params, deadline);
-        console.log(JSON.stringify(reply));
+        console.log(JSON.stringify(await send(options)));
       }
     }
   } catch (error) {

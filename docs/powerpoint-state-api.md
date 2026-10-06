@@ -72,11 +72,13 @@ Speaker notes are intentionally not included.
   "url": "C:\\Reports\\Quarterly review.pptx",
   "saved": true,
   "readOnly": false,
-  "slideCount": 12
+  "slideCount": 12,
+  "slideWidth": 960,
+  "slideHeight": 540
 }
 ```
 
-The presentation object provides `Name`, `FullName`, `Saved`, `ReadOnly`, and the `Slides` collection ([`Presentation`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.presentation), [`Presentation.Slides`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.presentation.slides)). `url` is empty for never-saved documents, matching the existing document descriptor behavior. `saved` reports Office's dirty/clean flag; this API does not save.
+The presentation object provides `Name`, `FullName`, `Saved`, `ReadOnly`, the `Slides` collection, and `PageSetup.SlideWidth`/`SlideHeight` in points ([`Presentation`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.presentation), [`Presentation.Slides`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.presentation.slides)). `url` is empty for never-saved documents, matching the existing document descriptor behavior. `saved` reports Office's dirty/clean flag; reads never save (use `presentation save`).
 
 ### Slide list
 
@@ -135,7 +137,7 @@ The listing includes `SlideID`, current `SlideIndex`, `Name`, and `SlideShowTran
 
 `Slide.Shapes` contains top-level placed shapes such as drawings, pictures, OLE objects, text objects, titles, and placeholders ([`Slide.Shapes`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.slide.shapes)). Each entry reports `Shape.Id`, `ZOrderPosition`, `Name`, numeric `Type`, geometry, and plain text if readable ([`Shape.Id`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.id), [`Shape.ZOrderPosition`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.zorderposition), [`Shape.Type`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.type), [`Shape.Left`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.left), [`Shape.Top`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.top), [`Shape.Width`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.width), [`Shape.Height`](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.shape.height)). IDs are numeric PowerPoint object-model values; names are included as human-readable metadata, not as unique keys.
 
-Text is extracted as plain text, not lossless text runs or formatting. `text: null` means no plain text could be read for that shape. This endpoint does not promise recursive group members, table cells, chart data, embedded-object contents, alt text, image content, or rich formatting. Those require separate, explicitly bounded APIs.
+Text is extracted as plain text, not lossless text runs or formatting; `shape state` (`GET .../shapes/{shape-id}`) returns per-run fonts and paragraph formatting. `text: null` means no plain text could be read for that shape. Group shapes (`shapeType` 6) carry their members, recursively, in `groupItems`. This endpoint does not promise table cells, chart data, embedded-object contents, alt text, or image content.
 
 ### Editing-window state
 

@@ -70,3 +70,40 @@ test('help lists the presentation command syntax', () => {
   assert.ok(result.stdout.includes('netoffice presentation new --path <file>'));
   assert.ok(result.stdout.includes('netoffice presentation open --path <file>'));
 });
+
+test('slide-or-master commands require exactly one container and send master as a flag', () => {
+  const base = ['shape', 'fill', '--target', target, '--shape-id', '3', '--color', '#112233'];
+  rejected(base, /exactly one of --slide-id, --master, or --custom-layout/);
+  rejected([...base, '--slide-id', '1', '--master'], /exactly one of --slide-id, --master, or --custom-layout/);
+  rejected([...base, '--master', '--custom-layout', '2'], /exactly one of --slide-id, --master, or --custom-layout/);
+  assert.deepEqual(parseArguments([...base, '--master']).params,
+    { targetId: target, shapeId: 3, color: '#112233', master: true });
+  assert.deepEqual(parseArguments([...base, '--custom-layout', '2']).params,
+    { targetId: target, shapeId: 3, color: '#112233', customLayout: 2 });
+  rejected(['slide', 'move', '--target', target, '--master', '--index', '1'], /Unknown option: --master/);
+  rejected(['shape', 'animation', '--target', target, '--master', '--shape-id', '1', '--effect', '10'],
+    /Unknown option: --master/);
+});
+
+test('typed values are validated before any request', () => {
+  const shape = ['--target', target, '--slide-id', '1', '--shape-id', '2'];
+  rejected(['shape', 'fill', ...shape, '--color', 'red'], /#RRGGBB/);
+  rejected(['shape', 'font', ...shape, '--bold', 'yes'], /true or false/);
+  rejected(['shape', 'group', '--target', target, '--slide-id', '1', '--shape-ids', '2,x'], /positive integer/);
+  rejected(['chart', 'data', ...shape, '--categories', 'Q1', '--series', 'Revenue'], /<name>:<v,v,...>/);
+  rejected(['slide', 'add', '--target', target, '--layout', '2', '--custom-layout', '3'], /only one of/);
+  rejected(['slide', 'add', '--target', target, '--custom-layout', '3', '--custom-layout-name', 'Content'], /only one of/);
+  rejected(['smartart', 'node', ...shape, '--text', 'x'], /exactly one of --index or --add/);
+  assert.deepEqual(parseArguments(['chart', 'data', ...shape, '--categories', 'Q1, Q2',
+    '--series', 'Rev: 1,2;Cost:3,-4']).params.series,
+    [{ name: 'Rev', values: [1, 2] }, { name: 'Cost', values: [3, -4] }]);
+});
+
+test('theme colors are grouped and paths resolve to absolute', () => {
+  assert.deepEqual(parseArguments(['presentation', 'colors', '--target', target,
+    '--accent1', '#1f3864', '--followed-hyperlink', '#000000']).params,
+    { targetId: target, colors: { accent1: '#1F3864', followedHyperlink: '#000000' } });
+  assert.equal(parseArguments(['presentation', 'save', '--target', target, '--path', 'Copy.pptx']).params.path,
+    path.resolve('Copy.pptx'));
+  assert.deepEqual(parseArguments(['smartart', 'layouts']).params, {});
+});

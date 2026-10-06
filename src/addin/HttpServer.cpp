@@ -115,7 +115,9 @@ namespace
 	enum class Endpoint
 	{
 		Unknown, Rpc, WebSocket, Version, List, New, Activate, Close,
-		Presentation, Slides, Slide, View, SlideShow
+		Presentation, Slides, Slide, View, SlideShow, AddSlide, AddShape,
+		SetShapeText, DeleteShape, DeleteSlide, SetCurrentSlide, StartSlideShow,
+		StopSlideShow, NavigateSlideShow
 	};
 
 	std::string_view RequestPath(const mg_request_info &request)
@@ -125,9 +127,9 @@ namespace
 		return request.local_uri_raw == nullptr ? std::string_view() : request.local_uri_raw;
 	}
 
-	bool IdentifyPresentationEndpoint(std::string_view path, Endpoint &endpoint,
-		std::string *target, long &slideId);
-	Endpoint IdentifyEndpoint(std::string_view path)
+	bool IdentifyPresentationEndpoint(std::string_view path, std::string_view method,
+		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId);
+	Endpoint IdentifyEndpoint(std::string_view path, std::string_view method)
 	{
 		if (path == "/json/rpc") return Endpoint::Rpc;
 		if (path == "/devtools/application") return Endpoint::WebSocket;
@@ -136,14 +138,34 @@ namespace
 		if (path == "/json/new") return Endpoint::New;
 		if (path == "/json/activate" || path.substr(0, 15) == "/json/activate/") return Endpoint::Activate;
 		if (path == "/json/close" || path.substr(0, 12) == "/json/close/") return Endpoint::Close;
-		Endpoint stateEndpoint = Endpoint::Unknown;
-		long slideId = 0;
-		if (IdentifyPresentationEndpoint(path, stateEndpoint, nullptr, slideId))
-			return stateEndpoint;
+		Endpoint endpoint = Endpoint::Unknown;
+		long slideId = 0, shapeId = 0;
+		if (IdentifyPresentationEndpoint(path, method, endpoint, nullptr, slideId, shapeId))
+			return endpoint;
 		return Endpoint::Unknown;
 	}
-	bool IdentifyPresentationEndpoint(std::string_view path, Endpoint &endpoint,
-		std::string *target, long &slideId)
+
+	bool ParsePositivePathId(std::string_view text, long &value)
+	{
+		value = 0;
+		if (text.empty())
+			return false;
+		unsigned long parsed = 0;
+		for (char digit : text)
+		{
+			if (digit < '0' || digit > '9' || parsed > (static_cast<unsigned long>(INT_MAX) -
+				static_cast<unsigned long>(digit - '0')) / 10)
+				return false;
+			parsed = parsed * 10 + static_cast<unsigned long>(digit - '0');
+		}
+		if (parsed == 0)
+			return false;
+		value = static_cast<long>(parsed);
+		return true;
+	}
+
+	bool IdentifyPresentationEndpoint(std::string_view path, std::string_view method,
+		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId)
 	{
 		constexpr std::string_view prefix = "/json/";
 		if (path.substr(0, prefix.size()) != prefix)
@@ -163,37 +185,49 @@ namespace
 		}
 		if (path == "slides")
 		{
-			endpoint = Endpoint::Slides;
+			endpoint = method == "POST" ? Endpoint::AddSlide : Endpoint::Slides;
 			return true;
 		}
 		if (path.substr(0, 7) == "slides/")
 		{
-			endpoint = Endpoint::Slide;
-			std::string_view value = path.substr(7);
-			if (value.empty())
-				return true;
-			unsigned long parsed = 0;
-			for (char digit : value)
+			path.remove_prefix(7);
+			size_t next = path.find('/');
+			std::string_view slidePart = path.substr(0, next);
+			ParsePositivePathId(slidePart, slideId);
+			if (next == std::string_view::npos)
 			{
-				if (digit < '0' || digit > '9' || parsed > (static_cast<unsigned long>(INT_MAX) -
-					static_cast<unsigned long>(digit - '0')) / 10)
-					return true;
-				parsed = parsed * 10 + static_cast<unsigned long>(digit - '0');
+				endpoint = method == "DELETE" ? Endpoint::DeleteSlide : Endpoint::Slide;
+				return true;
 			}
-			if (parsed > 0)
-				slideId = static_cast<long>(parsed);
-			else
-				slideId = 0;
-			return true;
+			path.remove_prefix(next + 1);
+			if (path == "shapes")
+			{
+				endpoint = method == "POST" ? Endpoint::AddShape : Endpoint::AddShape;
+				return true;
+			}
+			if (path.substr(0, 7) == "shapes/")
+			{
+				path.remove_prefix(7);
+				ParsePositivePathId(path, shapeId);
+				endpoint = method == "DELETE" ? Endpoint::DeleteShape : Endpoint::SetShapeText;
+				return true;
+			}
+			return false;
 		}
 		if (path == "view")
 		{
-			endpoint = Endpoint::View;
+			endpoint = method == "PUT" ? Endpoint::SetCurrentSlide : Endpoint::View;
 			return true;
 		}
 		if (path == "slide-show")
 		{
-			endpoint = Endpoint::SlideShow;
+			endpoint = method == "POST" ? Endpoint::StartSlideShow :
+				(method == "DELETE" ? Endpoint::StopSlideShow : Endpoint::SlideShow);
+			return true;
+		}
+		if (path == "slide-show/navigation")
+		{
+			endpoint = Endpoint::NavigateSlideShow;
 			return true;
 		}
 		return false;
@@ -201,8 +235,16 @@ namespace
 
 	const char *EndpointMethod(Endpoint endpoint)
 	{
-		if (endpoint == Endpoint::Rpc) return "POST";
-		if (endpoint == Endpoint::New || endpoint == Endpoint::Activate || endpoint == Endpoint::Close) return "PUT";
+		if (endpoint == Endpoint::Rpc || endpoint == Endpoint::AddSlide ||
+			endpoint == Endpoint::AddShape || endpoint == Endpoint::StartSlideShow ||
+			endpoint == Endpoint::NavigateSlideShow) return "POST";
+		if (endpoint == Endpoint::New || endpoint == Endpoint::Activate ||
+			endpoint == Endpoint::Close || endpoint == Endpoint::SetCurrentSlide ||
+			endpoint == Endpoint::SetShapeText) return "PUT";
+		if (endpoint == Endpoint::DeleteSlide || endpoint == Endpoint::DeleteShape ||
+			endpoint == Endpoint::StopSlideShow) return "DELETE";
+		if (endpoint == Endpoint::Slides || endpoint == Endpoint::Slide ||
+			endpoint == Endpoint::View || endpoint == Endpoint::SlideShow) return "GET";
 		return "GET";
 	}
 
@@ -302,7 +344,8 @@ namespace
 
 	int ProtocolError(mg_connection *connection, int status, const char *message, const char *allow = nullptr)
 	{
-		const bool rpc = IdentifyEndpoint(RequestPath(*mg_get_request_info(connection))) == Endpoint::Rpc;
+		const auto &request = *mg_get_request_info(connection);
+		const bool rpc = IdentifyEndpoint(RequestPath(request), request.request_method) == Endpoint::Rpc;
 		return SendHttp(connection, status,
 			(rpc ? ErrorReply(nullptr, -32600, message) : HttpErrorReply(-32600, message)).dump(), allow);
 	}
@@ -590,12 +633,12 @@ struct HttpServer::State
 				return ProtocolError(connection, 403, "Only the selected IPv4 loopback endpoint is allowed");
 			if (!AllowedOrigin(request, state.port))
 				return ProtocolError(connection, 403, "Origin is not local to this endpoint");
-			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request));
+			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request), request.request_method);
 			const bool websocket = endpoint == Endpoint::WebSocket;
 			if (endpoint == Endpoint::Unknown) return ProtocolError(connection, 404, "Unknown endpoint");
-			const char *method = EndpointMethod(endpoint);
-			if (std::string_view(request.request_method) != method)
-				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint", method);
+			if (std::string_view(request.request_method) != EndpointMethod(endpoint))
+				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint",
+					EndpointMethod(endpoint));
 			if (websocket)
 			{
 				if (std::string_view(request.http_version) != "1.1" ||
@@ -640,11 +683,12 @@ struct HttpServer::State
 		const auto &request = *mg_get_request_info(connection);
 		std::string_view path = RequestPath(request);
 		std::string target;
-		long slideId = 0;
+		long slideId = 0, shapeId = 0;
 		Endpoint endpoint = Endpoint::Unknown;
-		const bool stateRoute = IdentifyPresentationEndpoint(path, endpoint, &target, slideId);
+		const bool stateRoute = IdentifyPresentationEndpoint(path, request.request_method,
+			endpoint, &target, slideId, shapeId);
 		if (!stateRoute)
-			endpoint = IdentifyEndpoint(path);
+			endpoint = IdentifyEndpoint(path, request.request_method);
 		if (endpoint == Endpoint::Rpc)
 		{
 			auto session = Find(connection);
@@ -693,6 +737,15 @@ struct HttpServer::State
 			case Endpoint::Slide: command = AutomationDispatcher::HttpCommand::Slide; break;
 			case Endpoint::View: command = AutomationDispatcher::HttpCommand::View; break;
 			case Endpoint::SlideShow: command = AutomationDispatcher::HttpCommand::SlideShow; break;
+			case Endpoint::AddSlide: command = AutomationDispatcher::HttpCommand::AddSlide; break;
+			case Endpoint::AddShape: command = AutomationDispatcher::HttpCommand::AddShape; break;
+			case Endpoint::SetShapeText: command = AutomationDispatcher::HttpCommand::SetShapeText; break;
+			case Endpoint::DeleteShape: command = AutomationDispatcher::HttpCommand::DeleteShape; break;
+			case Endpoint::DeleteSlide: command = AutomationDispatcher::HttpCommand::DeleteSlide; break;
+			case Endpoint::SetCurrentSlide: command = AutomationDispatcher::HttpCommand::SetCurrentSlide; break;
+			case Endpoint::StartSlideShow: command = AutomationDispatcher::HttpCommand::StartSlideShow; break;
+			case Endpoint::StopSlideShow: command = AutomationDispatcher::HttpCommand::StopSlideShow; break;
+			case Endpoint::NavigateSlideShow: command = AutomationDispatcher::HttpCommand::NavigateSlideShow; break;
 			default: return ProtocolError(connection, 404, "Unknown endpoint");
 			}
 		}
@@ -714,6 +767,40 @@ struct HttpServer::State
 			default: return ProtocolError(connection, 404, "Unknown endpoint");
 			}
 		}
+		Json parameters = Json::object();
+		const bool needsBody = endpoint == Endpoint::AddSlide || endpoint == Endpoint::AddShape ||
+			endpoint == Endpoint::SetShapeText || endpoint == Endpoint::SetCurrentSlide ||
+			endpoint == Endpoint::NavigateSlideShow;
+		if (needsBody)
+		{
+			std::string_view contentType = Header(connection, "Content-Type");
+			if (!EqualAscii(Trim(contentType.substr(0, contentType.find(';'))), "application/json"))
+				return ProtocolError(connection, 415, "Content-Type must be application/json");
+			if (request.content_length > static_cast<long long>(MaxMessageBytes))
+				return ProtocolError(connection, 413, "Request exceeds the 1 MiB limit");
+			std::string body;
+			if (request.content_length > 0)
+				body.reserve(static_cast<size_t>(request.content_length));
+			std::array<char, 16 * 1024> buffer{};
+			for (;;)
+			{
+				if (session->cancelled->load())
+					return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
+				int bytes = mg_read(connection, buffer.data(), buffer.size());
+				if (bytes < 0)
+					return ProtocolError(connection, 400, "Unable to read the request body");
+				if (bytes == 0)
+					break;
+				if (static_cast<size_t>(bytes) > MaxMessageBytes - body.size())
+					return ProtocolError(connection, 413, "Request exceeds the 1 MiB limit");
+				body.append(buffer.data(), static_cast<size_t>(bytes));
+			}
+			if (request.content_length >= 0 && body.size() != static_cast<size_t>(request.content_length))
+				return ProtocolError(connection, 400, "Incomplete request body");
+			parameters = Json::parse(body, nullptr, false);
+			if (parameters.is_discarded() || !parameters.is_object())
+				return ProtocolError(connection, 400, "Request body must be a JSON object");
+		}
 		if ((endpoint == Endpoint::Activate || endpoint == Endpoint::Close) && !argument.empty())
 		{
 			// Decode exactly once with the library, retaining the returned byte count
@@ -726,8 +813,23 @@ struct HttpServer::State
 			if (argument.find('\0') != std::string::npos)
 				return SendHttp(connection, 400, HttpErrorReply(-32602, "Target must not contain a NUL character").dump());
 		}
-		Json envelope = dispatcher->HandleHttpRequest(command, argument, slideId,
-			endpoint == Endpoint::Close && force, session->cancelled);
+		if ((endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow) &&
+			parameters.contains("slideId"))
+		{
+			const auto &value = parameters["slideId"];
+			if (value.is_number_unsigned())
+			{
+				uint64_t parsed = value.get<uint64_t>();
+				if (parsed > 0 && parsed <= INT_MAX) slideId = static_cast<long>(parsed);
+			}
+			else if (value.is_number_integer())
+			{
+				int64_t parsed = value.get<int64_t>();
+				if (parsed > 0 && parsed <= INT_MAX) slideId = static_cast<long>(parsed);
+			}
+		}
+		Json envelope = dispatcher->HandleHttpRequest(command, argument, slideId, shapeId,
+			endpoint == Endpoint::Close && force, parameters, session->cancelled);
 		if (session->cancelled->load())
 			return SendHttp(connection, 503, HttpErrorReply(-32003, "Server is stopping").dump());
 		int status = 200;

@@ -132,6 +132,14 @@ there is no `jsonrpc` member.
 | `GET /json/{target}/slides/{slide-id}` | Slide metadata and shape IDs, z-order, type, bounds, and readable plain text |
 | `GET /json/{target}/view` | Editing-window view and selection state, when available |
 | `GET /json/{target}/slide-show` | Running slide-show windows and each current slide |
+| `POST /json/{target}/slides` | Create a slide (optional PowerPoint layout) |
+| `POST /json/{target}/slides/{slide-id}/shapes` | Create an auto-shape with bounds and optional text |
+| `PUT /json/{target}/slides/{slide-id}/shapes/{shape-id}` | Replace a shape's plain text |
+| `DELETE /json/{target}/slides/{slide-id}/shapes/{shape-id}` | Delete a shape |
+| `DELETE /json/{target}/slides/{slide-id}` | Delete a slide |
+| `PUT /json/{target}/view` | Set the target presentation's current editing slide |
+| `POST /json/{target}/slide-show` / `DELETE /json/{target}/slide-show` | Start / stop its slide show |
+| `POST /json/{target}/slide-show/navigation` | Navigate next, previous, or to a slide during a show |
 | `POST /json/rpc` | One JSON request and response; requires `Content-Type: application/json` |
 | `WS /devtools/application` | Application-wide UTF-8 JSON requests and correlated responses |
 
@@ -245,6 +253,29 @@ active presentation. These methods are not exposed as Node CLI commands.
 See [`docs/powerpoint-state-api.md`](docs/powerpoint-state-api.md) for full
 response examples, enum notes, and COM state caveats.
 
+### Mutating presentation state for tests
+
+Mutation routes are target-scoped and operate on the live, unsaved document;
+they never save automatically. Slide IDs are stable PowerPoint `SlideID`s.
+Slide creation defaults to blank layout `12`; optional `layout` accepts `1..12`.
+Shape creation requires `shapeType`, finite `left`/`top`, positive `width`/
+`height`, and accepts optional plain-text `text`. Shape updates replace all
+plain text. Deleting slides/shapes changes the document in memory.
+
+`PUT /json/{target}/view` accepts `{"slideId":259}`. Slideshow navigation
+accepts `{"action":"next"}`, `{"action":"previous"}`, or
+`{"action":"goto","slideId":259}`. Start/stop and navigation affect only show
+windows associated with that target.
+
+Matching WebSocket methods are `PowerPoint.addSlide`, `PowerPoint.createShape`,
+`PowerPoint.setShapeText`, `PowerPoint.deleteShape`, `PowerPoint.deleteSlide`,
+`PowerPoint.setCurrentSlide`, `PowerPoint.startSlideShow`,
+`PowerPoint.stopSlideShow`, and `PowerPoint.navigateSlideShow`. Every method
+requires `targetId`; slide and shape methods also require stable `slideId` and,
+where applicable, `shapeId`. For disconnect-sensitive mutations, use WebSocket:
+an abandoned HTTP call may still execute until its queue deadline.
+
+
 
 ### Application WebSocket commands
 
@@ -305,14 +336,13 @@ Server shutdown cancels queued work on both transports.
 ### Integration test
 
 On Windows, with the native add-in built and registered and the CLI dependencies
-installed, run the live PowerPoint state-read integration test:
-
+installed, run the live PowerPoint presentation API integration test:
 ```powershell
 npm --prefix src/cli run test:state-api
 ```
 
 The test launches or reuses PowerPoint, creates two unsaved test presentations,
-checks each read over HTTP and WebSocket, then discards both test documents.
+checks reads and mutations over HTTP and WebSocket, then discards both test documents.
 Set `NETOFFICE_PORT` if the registered add-in uses a non-default port.
 
 The endpoint is plaintext and unauthenticated, bound only to `127.0.0.1`.

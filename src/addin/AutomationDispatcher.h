@@ -17,7 +17,11 @@ class AutomationDispatcher : public std::enable_shared_from_this<AutomationDispa
 {
 public:
 	AutomationDispatcher() = default;
-	enum class HttpCommand { Version, List, New, Activate, Close, Presentation, Slides, Slide, View, SlideShow };
+	enum class HttpCommand {
+		Version, List, New, Activate, Close, Presentation, Slides, Slide, View, SlideShow,
+		AddSlide, AddShape, SetShapeText, DeleteShape, DeleteSlide, SetCurrentSlide,
+		StartSlideShow, StopSlideShow, NavigateSlideShow
+	};
 	~AutomationDispatcher();
 
 	HRESULT Start(IDispatch *app);
@@ -25,7 +29,8 @@ public:
 	nlohmann::json HandleRequest(const nlohmann::json &request,
 		const std::shared_ptr<std::atomic_bool> &cancelled);
 	nlohmann::json HandleHttpRequest(HttpCommand command, const std::string &argument,
-		long slideId, bool force, const std::shared_ptr<std::atomic_bool> &cancelled);
+		long slideId, long shapeId, bool force, const nlohmann::json &parameters,
+		const std::shared_ptr<std::atomic_bool> &cancelled);
 
 private:
 	struct Status
@@ -53,8 +58,8 @@ private:
 	Status Dispatch(const std::shared_ptr<PendingCall> &call);
 	bool IsStopping();
 
-	Status DispatchHttp(HttpCommand command, const std::string &argument, long slideId, bool force,
-		nlohmann::json &result);
+	Status DispatchHttp(HttpCommand command, const std::string &argument, long slideId,
+		long shapeId, bool force, const nlohmann::json &parameters, nlohmann::json &result);
 	Status GetPresentationState(IDispatch *document, const std::string &id, nlohmann::json &result);
 	Status GetSlides(IDispatch *document, const std::string &id, nlohmann::json &result);
 	Status GetSlideState(IDispatch *document, const std::string &id, long slideId, nlohmann::json &result);
@@ -64,6 +69,9 @@ private:
 	Status GetDouble(IDispatch *object, const wchar_t *name, double &result);
 	Status GetBoolean(IDispatch *object, const wchar_t *name, bool &result);
 	Status GetSlideById(IDispatch *document, long slideId, ATL::CComPtr<IDispatch> &slide, long &index);
+	Status MutatePresentation(HttpCommand command, IDispatch *document, const std::string &id,
+		long slideId, long shapeId, const nlohmann::json &parameters, nlohmann::json &result);
+	Status GetShapeById(IDispatch *slide, long shapeId, ATL::CComPtr<IDispatch> &shape);
 	Status ApplicationMetadata(nlohmann::json &result);
 	Status RefreshTargets(nlohmann::json &result);
 	Status DescribeDocument(IDispatch *document, const std::string &id, nlohmann::json &result);

@@ -39,7 +39,7 @@ async function request(client, method, params = {}) {
   return client.request(method, params, deadline());
 }
 
-test('PowerPoint presentation state is readable over HTTP and WebSocket', async t => {
+test('PowerPoint presentation state is readable and controllable over HTTP and WebSocket', async t => {
   assert.ok(Number.isInteger(port) && port > 0 && port <= 65535, 'NETOFFICE_PORT must be a valid TCP port');
   execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'netoffice.js'),
     'powerpoint', 'launch', '--port', String(port), '--timeout', '30000'], { stdio: 'inherit' });
@@ -101,6 +101,125 @@ test('PowerPoint presentation state is readable over HTTP and WebSocket', async 
     assert.equal(typeof slide.name, 'string');
     assert.equal(typeof slide.hidden, 'boolean');
     assert.ok(Number.isInteger(slide.slideId) && slide.slideId > 0);
+
+    let mutationSlideIds;
+
+    await t.test('creates slides over HTTP and WebSocket', async () => {
+      const httpResponse = await fetch(`${baseUrl}/json/${target.id}/slides`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ layout: 12 })
+      });
+      const http = await httpResponse.json();
+      assert.equal(httpResponse.status, 200);
+      assert.equal(http.id, target.id);
+      assert.equal(http.slideIndex, 2);
+      assert.ok(Number.isInteger(http.slideId) && http.slideId > 0);
+
+      const websocket = await request(client, 'PowerPoint.addSlide',
+        { targetId: target.id, layout: 12 });
+      assert.equal(websocket.id, target.id);
+      assert.equal(websocket.slideIndex, 3);
+      assert.ok(Number.isInteger(websocket.slideId) && websocket.slideId > 0);
+      const slides = await request(client, 'PowerPoint.getSlides', { targetId: target.id });
+      assert.ok(slides.slides.some(slide => slide.slideId === http.slideId));
+      assert.ok(slides.slides.some(slide => slide.slideId === websocket.slideId));
+      mutationSlideIds = [http.slideId, websocket.slideId];
+    });
+
+    await t.test('creates, edits, navigates, and removes tester content over both transports', async () => {
+      const [httpSlideId, websocketSlideId] = mutationSlideIds;
+      const mutateHttp = async (pathname, method, payload) => {
+        const response = await fetch(`${baseUrl}${pathname}`, {
+          method,
+          ...(payload === undefined ? {} : {
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+        });
+        return { status: response.status, body: await response.json() };
+      };
+      const createShape = { shapeType: 1, left: 24, top: 36, width: 160, height: 48 };
+      const httpShape = await mutateHttp(
+        `/json/${target.id}/slides/${httpSlideId}/shapes`, 'POST',
+        { ...createShape, text: 'Created through HTTP' });
+      assert.equal(httpShape.status, 200);
+      assert.equal(httpShape.body.slideId, httpSlideId);
+      assert.ok(Number.isInteger(httpShape.body.shapeId));
+      const websocketShape = await request(client, 'PowerPoint.createShape', {
+        targetId: target.id, slideId: websocketSlideId,
+        ...createShape, text: 'Created through WebSocket'
+      });
+      assert.equal(websocketShape.slideId, websocketSlideId);
+      assert.ok(Number.isInteger(websocketShape.shapeId));
+
+      const changedHttpText = await mutateHttp(
+        `/json/${target.id}/slides/${httpSlideId}/shapes/${httpShape.body.shapeId}`,
+        'PUT', { text: 'Updated through HTTP' });
+      assert.equal(changedHttpText.status, 200);
+      const changedWebSocketText = await request(client, 'PowerPoint.setShapeText', {
+        targetId: target.id, slideId: websocketSlideId, shapeId: websocketShape.shapeId,
+        text: 'Updated through WebSocket'
+      });
+      assert.equal(changedWebSocketText.text, 'Updated through WebSocket');
+      for (const [slideId, expectedText] of [
+        [httpSlideId, 'Updated through HTTP'],
+        [websocketSlideId, 'Updated through WebSocket']
+      ]) {
+        const state = await request(client, 'PowerPoint.getSlideState', { targetId: target.id, slideId });
+        assert.ok(state.slide.shapes.some(shape => shape.text === expectedText));
+      }
+
+      const currentHttp = await mutateHttp(`/json/${target.id}/view`, 'PUT', { slideId: httpSlideId });
+      assert.equal(currentHttp.status, 200);
+      assert.equal(currentHttp.body.slideId, httpSlideId);
+      const currentWebSocket = await request(client, 'PowerPoint.setCurrentSlide', {
+        targetId: target.id, slideId: slide.slideId
+      });
+      assert.equal(currentWebSocket.slideId, slide.slideId);
+      const view = await request(client, 'PowerPoint.getViewState', { targetId: target.id });
+      assert.ok(view.windows.some(window => window.currentSlideId === slide.slideId));
+
+      const started = await mutateHttp(`/json/${target.id}/slide-show`, 'POST');
+      assert.equal(started.status, 200);
+      assert.equal(started.body.running, true);
+      const next = await mutateHttp(
+        `/json/${target.id}/slide-show/navigation`, 'POST', { action: 'next' });
+      assert.equal(next.status, 200);
+      assert.ok(next.body.windows.some(window => window.currentSlideId === httpSlideId));
+      const goto = await request(client, 'PowerPoint.navigateSlideShow', {
+        targetId: target.id, action: 'goto', slideId: websocketSlideId
+      });
+      assert.ok(goto.windows.some(window => window.currentSlideId === websocketSlideId));
+      const previous = await request(client, 'PowerPoint.navigateSlideShow', {
+        targetId: target.id, action: 'previous'
+      });
+      assert.ok(previous.windows.some(window => window.currentSlideId === httpSlideId));
+      const stopped = await request(client, 'PowerPoint.stopSlideShow', { targetId: target.id });
+      assert.equal(stopped.running, false);
+      const startedByWebSocket = await request(client, 'PowerPoint.startSlideShow',
+        { targetId: target.id });
+      assert.equal(startedByWebSocket.running, true);
+      const stoppedByHttp = await mutateHttp(`/json/${target.id}/slide-show`, 'DELETE');
+      assert.equal(stoppedByHttp.status, 200);
+      assert.equal(stoppedByHttp.body.running, false);
+
+      const deletedHttpShape = await mutateHttp(
+        `/json/${target.id}/slides/${httpSlideId}/shapes/${httpShape.body.shapeId}`, 'DELETE');
+      assert.equal(deletedHttpShape.status, 200);
+      const deletedWebSocketShape = await request(client, 'PowerPoint.deleteShape', {
+        targetId: target.id, slideId: websocketSlideId, shapeId: websocketShape.shapeId
+      });
+      assert.equal(deletedWebSocketShape.deleted, true);
+      const deletedHttpSlide = await mutateHttp(`/json/${target.id}/slides/${httpSlideId}`, 'DELETE');
+      assert.equal(deletedHttpSlide.status, 200);
+      const deletedWebSocketSlide = await request(client, 'PowerPoint.deleteSlide', {
+        targetId: target.id, slideId: websocketSlideId
+      });
+      assert.equal(deletedWebSocketSlide.deleted, true);
+      const remaining = await request(client, 'PowerPoint.getSlides', { targetId: target.id });
+      assert.deepEqual(remaining.slides.map(item => item.slideId), [slide.slideId]);
+    });
 
     await t.test('slide detail includes title shape and stable shape metadata', async () => {
       const [http, websocket] = await Promise.all([
@@ -174,15 +293,26 @@ test('PowerPoint presentation state is readable over HTTP and WebSocket', async 
       assert.deepEqual(stoppedHttp.body.windows, []);
     });
 
-    await t.test('invalid targets and slide IDs return the documented errors', async () => {
+    await t.test('invalid targets, IDs, and mutation parameters return documented errors', async () => {
       const invalidTarget = await getJson('/json/not-a-guid/slides');
       assert.equal(invalidTarget.status, 400);
       const missingTarget = await getJson('/json/00000000-0000-0000-0000-000000000000/slides');
       assert.equal(missingTarget.status, 404);
       const invalidSlideId = await getJson(`/json/${target.id}/slides/0`);
       assert.equal(invalidSlideId.status, 400);
-      const unsupportedVerb = await fetch(`${baseUrl}/json/${target.id}/slides`, { method: 'POST' });
+      const unsupportedVerb = await fetch(`${baseUrl}/json/${target.id}/view`, { method: 'DELETE' });
       assert.equal(unsupportedVerb.status, 405);
+      const invalidShape = await fetch(`${baseUrl}/json/${target.id}/slides/${slide.slideId}/shapes`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ shapeType: 1, left: 0, top: 0, width: 0, height: 10 })
+      });
+      assert.equal(invalidShape.status, 400);
+      const invalidShapeWs = await request(client, 'PowerPoint.createShape', {
+        targetId: target.id, slideId: slide.slideId,
+        shapeType: 1, left: 0, top: 0, width: 0, height: 10
+      }).then(() => null, error => error);
+      assert.equal(invalidShapeWs.code, -32602);
       const unknownSlideId = slide.slideId + 100000;
       const missingSlide = await getJson(`/json/${target.id}/slides/${unknownSlideId}`);
       assert.equal(missingSlide.status, 404);

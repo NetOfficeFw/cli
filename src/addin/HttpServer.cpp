@@ -117,8 +117,9 @@ namespace
 		Unknown, Rpc, WebSocket, Version, List, New, NamedNew, Activate, Close,
 		Presentation, Slides, Slide, View, SlideShow, AddSlide, AddShape,
 		SetShapeText, DeleteShape, DeleteSlide, SetCurrentSlide, StartSlideShow,
-		StopSlideShow, NavigateSlideShow
+		StopSlideShow, NavigateSlideShow, Command
 	};
+	using CommandInfo = AutomationDispatcher::CommandInfo;
 
 	std::string_view RequestPath(const mg_request_info &request)
 	{
@@ -127,9 +128,29 @@ namespace
 		return request.local_uri_raw == nullptr ? std::string_view() : request.local_uri_raw;
 	}
 
+	// Prefer the row whose verb matches; otherwise return a same-route row so the
+	// caller reports 405 with that row's Allow verb.
+	const CommandInfo *FindCommandRoute(std::initializer_list<CommandScope> scopes,
+		std::string_view suffix, std::string_view method)
+	{
+		const CommandInfo *fallback = nullptr;
+		for (const auto &info : AutomationDispatcher::Commands())
+		{
+			if (std::find(scopes.begin(), scopes.end(), info.scope) == scopes.end() || suffix != info.suffix)
+				continue;
+			if (method == info.verb)
+				return &info;
+			if (fallback == nullptr)
+				fallback = &info;
+		}
+		return fallback;
+	}
+
 	bool IdentifyPresentationEndpoint(std::string_view path, std::string_view method,
-		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId);
-	Endpoint IdentifyEndpoint(std::string_view path, std::string_view method)
+		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId,
+		const CommandInfo *&command, bool &master, long &customLayout);
+	Endpoint IdentifyEndpoint(std::string_view path, std::string_view method,
+		const CommandInfo **command = nullptr)
 	{
 		if (path == "/json/rpc") return Endpoint::Rpc;
 		if (path == "/devtools/application") return Endpoint::WebSocket;
@@ -138,11 +159,20 @@ namespace
 		if (path == "/json/new") return method == "POST" ? Endpoint::NamedNew : Endpoint::New;
 		if (path == "/json/activate" || path.substr(0, 15) == "/json/activate/") return Endpoint::Activate;
 		if (path == "/json/close" || path.substr(0, 12) == "/json/close/") return Endpoint::Close;
+		const CommandInfo *info = nullptr;
+		if (path.substr(0, 6) == "/json/" && path.find('/', 6) == std::string_view::npos)
+			info = FindCommandRoute({ CommandScope::Application }, path.substr(6), method);
 		Endpoint endpoint = Endpoint::Unknown;
-		long slideId = 0, shapeId = 0;
-		if (IdentifyPresentationEndpoint(path, method, endpoint, nullptr, slideId, shapeId))
-			return endpoint;
-		return Endpoint::Unknown;
+		long slideId = 0, shapeId = 0, customLayout = 0;
+		bool master = false;
+		if (info != nullptr)
+			endpoint = Endpoint::Command;
+		else if (!IdentifyPresentationEndpoint(path, method, endpoint, nullptr, slideId, shapeId, info,
+			master, customLayout))
+			return Endpoint::Unknown;
+		if (command != nullptr)
+			*command = info;
+		return endpoint;
 	}
 
 	bool ParsePositivePathId(std::string_view text, long &value)
@@ -164,8 +194,45 @@ namespace
 		return true;
 	}
 
+	// Routes below a slide (slides/{id}/...) or the slide master (master/...).
+	bool IdentifyContainerEndpoint(std::string_view path, std::string_view method,
+		std::initializer_list<CommandScope> scopes, Endpoint &endpoint, long &shapeId,
+		const CommandInfo *&command)
+	{
+		if (path == "shapes")
+		{
+			endpoint = Endpoint::AddShape;
+			return true;
+		}
+		if (path.substr(0, 7) == "shapes/")
+		{
+			path.remove_prefix(7);
+			const size_t next = path.find('/');
+			ParsePositivePathId(path.substr(0, next), shapeId);
+			if (next == std::string_view::npos)
+			{
+				if (method == "GET")
+				{
+					command = FindCommandRoute({ CommandScope::Shape }, "", method);
+					endpoint = Endpoint::Command;
+				}
+				else
+					endpoint = method == "DELETE" ? Endpoint::DeleteShape : Endpoint::SetShapeText;
+				return true;
+			}
+			command = FindCommandRoute({ CommandScope::Shape }, path.substr(next + 1), method);
+		}
+		else
+			command = FindCommandRoute(scopes, path, method);
+		if (command == nullptr)
+			return false;
+		endpoint = Endpoint::Command;
+		return true;
+	}
+
 	bool IdentifyPresentationEndpoint(std::string_view path, std::string_view method,
-		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId)
+		Endpoint &endpoint, std::string *target, long &slideId, long &shapeId,
+		const CommandInfo *&command, bool &master, long &customLayout)
 	{
 		constexpr std::string_view prefix = "/json/";
 		if (path.substr(0, prefix.size()) != prefix)
@@ -178,6 +245,9 @@ namespace
 		if (target != nullptr)
 			target->assign(targetView);
 		path.remove_prefix(separator + 1);
+		command = nullptr;
+		master = false;
+		customLayout = 0;
 		if (path == "presentation")
 		{
 			endpoint = Endpoint::Presentation;
@@ -199,20 +269,29 @@ namespace
 				endpoint = method == "DELETE" ? Endpoint::DeleteSlide : Endpoint::Slide;
 				return true;
 			}
-			path.remove_prefix(next + 1);
-			if (path == "shapes")
-			{
-				endpoint = method == "POST" ? Endpoint::AddShape : Endpoint::AddShape;
-				return true;
-			}
-			if (path.substr(0, 7) == "shapes/")
-			{
-				path.remove_prefix(7);
-				ParsePositivePathId(path, shapeId);
-				endpoint = method == "DELETE" ? Endpoint::DeleteShape : Endpoint::SetShapeText;
-				return true;
-			}
-			return false;
+			if (next + 1 == path.size())
+				return false;
+			return IdentifyContainerEndpoint(path.substr(next + 1), method,
+				{ CommandScope::Slide, CommandScope::Container }, endpoint, shapeId, command);
+		}
+		if (path.substr(0, 7) == "master/" && path.size() > 7)
+		{
+			master = true;
+			return IdentifyContainerEndpoint(path.substr(7), method,
+				{ CommandScope::Container }, endpoint, shapeId, command);
+		}
+		if (path.substr(0, 8) == "layouts/")
+		{
+			// layouts/{index} reads the layout; layouts/{index}/... edits it like a slide or the master.
+			path.remove_prefix(8);
+			const size_t next = path.find('/');
+			ParsePositivePathId(path.substr(0, next), customLayout);
+			if (customLayout == 0)
+				return false;
+			if (next != std::string_view::npos && next + 1 == path.size())
+				return false;
+			return IdentifyContainerEndpoint(next == std::string_view::npos ? std::string_view() :
+				path.substr(next + 1), method, { CommandScope::Container }, endpoint, shapeId, command);
 		}
 		if (path == "view")
 		{
@@ -230,7 +309,11 @@ namespace
 			endpoint = Endpoint::NavigateSlideShow;
 			return true;
 		}
-		return false;
+		command = FindCommandRoute({ CommandScope::Target }, path, method);
+		if (command == nullptr)
+			return false;
+		endpoint = Endpoint::Command;
+		return true;
 	}
 
 	const char *EndpointMethod(Endpoint endpoint)
@@ -634,12 +717,13 @@ struct HttpServer::State
 				return ProtocolError(connection, 403, "Only the selected IPv4 loopback endpoint is allowed");
 			if (!AllowedOrigin(request, state.port))
 				return ProtocolError(connection, 403, "Origin is not local to this endpoint");
-			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request), request.request_method);
+			const CommandInfo *command = nullptr;
+			const Endpoint endpoint = IdentifyEndpoint(RequestPath(request), request.request_method, &command);
 			const bool websocket = endpoint == Endpoint::WebSocket;
 			if (endpoint == Endpoint::Unknown) return ProtocolError(connection, 404, "Unknown endpoint");
-			if (std::string_view(request.request_method) != EndpointMethod(endpoint))
-				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint",
-					EndpointMethod(endpoint));
+			const char *allowed = command != nullptr ? command->verb : EndpointMethod(endpoint);
+			if (std::string_view(request.request_method) != allowed)
+				return ProtocolError(connection, 405, "HTTP method is not supported by this endpoint", allowed);
 			if (websocket)
 			{
 				if (std::string_view(request.http_version) != "1.1" ||
@@ -686,10 +770,13 @@ struct HttpServer::State
 		std::string target;
 		long slideId = 0, shapeId = 0;
 		Endpoint endpoint = Endpoint::Unknown;
+		const CommandInfo *commandInfo = nullptr;
+		bool master = false;
+		long customLayout = 0;
 		const bool stateRoute = IdentifyPresentationEndpoint(path, request.request_method,
-			endpoint, &target, slideId, shapeId);
+			endpoint, &target, slideId, shapeId, commandInfo, master, customLayout);
 		if (!stateRoute)
-			endpoint = IdentifyEndpoint(path, request.request_method);
+			endpoint = IdentifyEndpoint(path, request.request_method, &commandInfo);
 		if (endpoint == Endpoint::Rpc)
 		{
 			auto session = Find(connection);
@@ -747,6 +834,7 @@ struct HttpServer::State
 			case Endpoint::StartSlideShow: command = AutomationDispatcher::HttpCommand::StartSlideShow; break;
 			case Endpoint::StopSlideShow: command = AutomationDispatcher::HttpCommand::StopSlideShow; break;
 			case Endpoint::NavigateSlideShow: command = AutomationDispatcher::HttpCommand::NavigateSlideShow; break;
+			case Endpoint::Command: command = commandInfo->command; break;
 			default: return ProtocolError(connection, 404, "Unknown endpoint");
 			}
 		}
@@ -766,13 +854,15 @@ struct HttpServer::State
 				command = AutomationDispatcher::HttpCommand::Close;
 				argument = path.size() > 12 ? std::string(path.substr(12)) : "";
 				break;
+			case Endpoint::Command: command = commandInfo->command; argument.clear(); break;
 			default: return ProtocolError(connection, 404, "Unknown endpoint");
 			}
 		}
 		Json parameters = Json::object();
 		const bool needsBody = endpoint == Endpoint::NamedNew || endpoint == Endpoint::AddSlide ||
 			endpoint == Endpoint::AddShape || endpoint == Endpoint::SetShapeText ||
-			endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow;
+			endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow ||
+			(endpoint == Endpoint::Command && std::string_view(commandInfo->verb) != "GET");
 		if (needsBody)
 		{
 			std::string_view contentType = Header(connection, "Content-Type");
@@ -815,6 +905,15 @@ struct HttpServer::State
 			if (argument.find('\0') != std::string::npos)
 				return SendHttp(connection, 400, HttpErrorReply(-32602, "Target must not contain a NUL character").dump());
 		}
+		// The route alone selects a slide, the master, or a layout; never trust a body member for it.
+		// (On slide creation, customLayout instead names the new slide's layout.)
+		parameters.erase("master");
+		if (master)
+			parameters["master"] = true;
+		if (endpoint != Endpoint::AddSlide)
+			parameters.erase("customLayout");
+		if (customLayout > 0)
+			parameters["customLayout"] = customLayout;
 		if ((endpoint == Endpoint::SetCurrentSlide || endpoint == Endpoint::NavigateSlideShow) &&
 			parameters.contains("slideId"))
 		{

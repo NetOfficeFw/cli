@@ -2,6 +2,42 @@
 
 > NetOffice command line tool for running automation tests of Microsoft Office applications.
 
+## Quick setup (Windows, 64-bit Office)
+
+`scripts/Install-Cli.ps1` performs the whole setup from a checkout and
+leaves `netoffice` on `PATH`, ready for agents and scripts:
+
+```powershell
+pwsh -NoProfile -File scripts/Install-Cli.ps1
+```
+
+Prerequisites (the script fails early, naming the missing one):
+
+- PowerShell 7 and Windows.
+- 64-bit Click-to-Run Microsoft Office, with PowerPoint **closed**.
+- Node.js 20 or newer, with npm's global bin directory on `PATH`.
+- Visual Studio with the Desktop C++ workload (v145 toolset, Windows SDK, ATL).
+- [vcpkg](https://github.com/microsoft/vcpkg) available to MSBuild, through Visual Studio's bundled copy or
+  `vcpkg integrate install`. `vcpkg` need not be on `PATH`; a missing integration fails the build step.
+
+It then, in order: builds `src/addin` as Release x64
+(`src/addin/build/Release_x64/addin.dll`), registers the add-in for the current
+user (HKCU, no elevation), runs `npm ci` in `src/cli`, runs `npm link` so
+`netoffice` resolves to this checkout, and finally launches PowerPoint once,
+lists presentations over the add-in's WebSocket, and shuts PowerPoint down again.
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `-Port` | `50051` | Loopback port stored in HKCU; the CLI's `--port` default must match |
+| `-OfficeExtensibilityDir` | 64-bit `…\ProgramFilesCommonX64\DESIGNER` | Directory containing `MSADDNDR.OLB` |
+| `-SkipVerify` | off | Skip the PowerPoint launch/shutdown check |
+
+The script is safe to repeat. Each run rebuilds, re-registers, and re-links, and
+prints a warning when it re-points a `netoffice` link that targeted another
+checkout. The link is a symlink to `src/cli`, so CLI (JavaScript) edits apply
+immediately; changes under `src/addin` need the script (or the `msbuild` command
+below) run again with PowerPoint closed. The manual steps follow.
+
 ## PowerPoint addin
 
 `src/addin` builds the native `NetOffice.Automate` COM addin

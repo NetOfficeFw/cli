@@ -373,9 +373,16 @@ instead of `layout`; its result then includes the resolved `customLayout`.
 | `shape flip`, `duplicate`, `copy-format`, `ungroup`, `animation` | `flipShape`, `duplicateShape`, `copyShapeFormat`, `ungroupShape`, `addAnimation` | `POST …/shapes/{id}/flip`, `duplicate`, `format`, `ungroup`, `animations` |
 | `shape font`, `paragraph`, `textframe` | `setShapeFont`, `setShapeParagraph`, `setShapeTextFrame` | `PUT …/shapes/{id}/text/font`, `text/paragraphs`, `text/frame` |
 | `shape group`, `align`, `distribute` | `groupShapes`, `alignShapes`, `distributeShapes` | `POST …/groups`, `alignment`, `distribution` |
-| `textbox add`, `line add`, `connector add`, `picture add`, `table add`, `chart add`, `smartart add` | `addTextbox`, `addLine`, `addConnector`, `addPicture`, `addTable`, `addChart`, `addSmartArt` | `POST …/textboxes`, `lines`, `connectors`, `pictures`, `tables`, `charts`, `smartart` |
+| `textbox add`, `line add`, `freeform add`, `connector add`, `picture add`, `table add`, `chart add`, `smartart add` | `addTextbox`, `addLine`, `addFreeform`, `addConnector`, `addPicture`, `addTable`, `addChart`, `addSmartArt` | `POST …/textboxes`, `lines`, `freeforms`, `connectors`, `pictures`, `tables`, `charts`, `smartart` |
 | `connector connect`, `table cell`, `chart data`, `chart title`, `smartart node` | `connectConnector`, `setTableCell`, `setChartData`, `setChartTitle`, `setSmartArtNode` | `PUT …/shapes/{id}/connections`, `cells`, `chart/data`, `chart/title`, `smartart/nodes` |
 | `smartart layouts` | `getSmartArtLayouts` | `GET /json/smartart-layouts` |
+
+`freeform add` / `addFreeform` draws one freeform (`Shapes.BuildFreeform` →
+`FreeformBuilder.AddNodes` → `ConvertToShape`) through `points`, a JSON array of
+2–10000 `{"x": <pt>, "y": <pt>}` objects (−10000…10000, at least two distinct)
+joined in order by straight segments. Repeat the first point last to close the
+shape. The CLI takes `--points "x,y;x,y;…"`. The result carries `shapeId`, `name`,
+and the accepted `points`.
 
 `netoffice --help` lists every option, value, and enum name. For example:
 

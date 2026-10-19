@@ -93,6 +93,22 @@ test('slide, master, and application commands resolve their scope over both tran
     const grouped = detail.slide.shapes.find(shape => shape.shapeId === group.shapeId);
     assert.deepEqual(grouped.groupItems.map(item => item.shapeId).sort(), [shapeId, second.shapeId].sort());
 
+    // Freeforms are built from straight segments through the points; invalid input creates nothing.
+    const before = (await request('PowerPoint.getSlideState', { targetId, slideId })).slide.shapes.length;
+    const triangle = [{ x: 300, y: 100 }, { x: 400, y: 250 }, { x: 250, y: 220 }, { x: 300, y: 100 }];
+    const freeform = await http('POST', `/json/${targetId}/slides/${slideId}/freeforms`, { points: triangle });
+    assert.equal(freeform.status, 200);
+    assert.equal(freeform.body.slideId, slideId);
+    const drawn = (await request('PowerPoint.getShapeState', { targetId, slideId, shapeId: freeform.body.shapeId }));
+    assert.equal(drawn.shapeType, 5);
+    assert.deepEqual([drawn.bounds.left, drawn.bounds.top, drawn.bounds.width, drawn.bounds.height].map(Math.round),
+      [250, 100, 150, 150]);
+    for (const points of [undefined, [], [{ x: 1, y: 1 }], [{ x: 1, y: 1 }, { x: 1, y: 1 }],
+      [{ x: 1, y: 1 }, { x: 'a', y: 2 }], [{ x: 1, y: 1 }, { x: 2 }], [{ x: 1, y: 1 }, [2, 3]],
+      [{ x: 1, y: 1 }, { x: 20000, y: 2 }], 'x'])
+      await assert.rejects(request('PowerPoint.addFreeform', { targetId, slideId, points }), error => error.code === -32602);
+    assert.equal((await request('PowerPoint.getSlideState', { targetId, slideId })).slide.shapes.length, before + 1);
+
     // Application-scoped reads need no target.
     const layouts = await http('GET', '/json/smartart-layouts');
     assert.equal(layouts.status, 200);

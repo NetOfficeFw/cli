@@ -57,6 +57,7 @@
 	/* Lines, pictures, grouping, arrangement (ContentCommands.cpp) */ \
 	NETOFFICE_COMMAND(AddLine, "PowerPoint.addLine", "POST", Container, "lines") \
 	NETOFFICE_COMMAND(AddConnector, "PowerPoint.addConnector", "POST", Container, "connectors") \
+	NETOFFICE_COMMAND(AddFreeform, "PowerPoint.addFreeform", "POST", Container, "freeforms") \
 	NETOFFICE_COMMAND(ConnectConnector, "PowerPoint.connectConnector", "PUT", Shape, "connections") \
 	NETOFFICE_COMMAND(AddPicture, "PowerPoint.addPicture", "POST", Container, "pictures") \
 	NETOFFICE_COMMAND(GroupShapes, "PowerPoint.groupShapes", "POST", Container, "groups") \

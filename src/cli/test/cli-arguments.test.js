@@ -99,6 +99,20 @@ test('typed values are validated before any request', () => {
     [{ name: 'Rev', values: [1, 2] }, { name: 'Cost', values: [3, -4] }]);
 });
 
+test('freeform add parses --points into x/y objects and rejects malformed lists', () => {
+  const base = ['freeform', 'add', '--target', target, '--slide-id', '1'];
+  assert.deepEqual(parseArguments([...base, '--points', '10,20; -5.5,3e1;0,0']).params, {
+    targetId: target, slideId: 1, points: [{ x: 10, y: 20 }, { x: -5.5, y: 30 }, { x: 0, y: 0 }]
+  });
+  assert.equal(parseArguments(['freeform', 'add', '--target', target, '--master', '--points', '1,1;2,2']).params.master, true);
+  rejected(base, /requires --points/);
+  rejected([...base, '--points', '1,2'], /at least two points/);
+  rejected([...base, '--points', '1,2;3'], /"<x>,<y>" pairs/);
+  rejected([...base, '--points', '1,2;3,4,5'], /"<x>,<y>" pairs/);
+  rejected([...base, '--points', '1,2;a,4'], /finite number/);
+  rejected([...base, '--points', '1,2;3,4;'], /"<x>,<y>" pairs/);
+});
+
 test('theme colors are grouped and paths resolve to absolute', () => {
   assert.deepEqual(parseArguments(['presentation', 'colors', '--target', target,
     '--accent1', '#1f3864', '--followed-hyperlink', '#000000']).params,

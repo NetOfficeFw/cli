@@ -2,7 +2,10 @@
 #include "AutomationDispatcher.h"
 
 #include <cctype>
+#include <cmath>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -59,6 +62,69 @@ AutomationDispatcher::Status AutomationDispatcher::AddConnector(const CommandCon
 	status = CallObject(shapes, L"AddConnector", { ATL::CComVariant(*connectorType),
 		ATL::CComVariant(static_cast<float>(*beginX)), ATL::CComVariant(static_cast<float>(*beginY)),
 		ATL::CComVariant(static_cast<float>(*endX)), ATL::CComVariant(static_cast<float>(*endY)) }, shape);
+	if (!status.ok())
+		return status;
+	long shapeId = 0;
+	std::string name;
+	status = GetInteger(shape, L"Id", shapeId);
+	if (status.ok()) status = GetString(shape, L"Name", name);
+	if (!status.ok())
+		return status;
+	result["shapeId"] = shapeId;
+	result["name"] = name;
+	return {};
+}
+
+AutomationDispatcher::Status AutomationDispatcher::AddFreeform(const CommandContext &context,
+	nlohmann::json &result)
+{
+	// Shapes.BuildFreeform + FreeformBuilder.AddNodes(msoSegmentLine, msoEditingAuto) +
+	// ConvertToShape. The shape is created only by ConvertToShape, so every validation
+	// and builder failure leaves the container untouched.
+	constexpr size_t MaximumPoints = 10000;
+	if (!context.parameters.contains("points"))
+		return InvalidParameter("points is required");
+	const auto &points = context.parameters["points"];
+	if (!points.is_array() || points.size() < 2 || points.size() > MaximumPoints)
+		return InvalidParameter("points must be an array of 2 through 10000 {x, y} objects");
+	auto coordinate = [](const nlohmann::json &point, const char *name, float &value)
+	{
+		if (!point.contains(name) || !point[name].is_number())
+			return false;
+		const double number = point[name].get<double>();
+		if (!std::isfinite(number) || number < -CoordinateLimit || number > CoordinateLimit)
+			return false;
+		value = static_cast<float>(number);
+		return true;
+	};
+	std::vector<std::pair<float, float>> vertices;
+	vertices.reserve(points.size());
+	bool distinct = false;
+	for (size_t index = 0; index < points.size(); ++index)
+	{
+		float x = 0, y = 0;
+		const auto &point = points[index];
+		if (!point.is_object() || point.size() != 2 || !coordinate(point, "x", x) || !coordinate(point, "y", y))
+			return InvalidParameter("points[" + std::to_string(index) +
+				"] must be an object with only finite numbers x and y from -10000 through 10000");
+		vertices.emplace_back(x, y);
+		distinct = distinct || vertices.back() != vertices.front();
+	}
+	if (!distinct)
+		return InvalidParameter("points must contain at least two distinct points");
+
+	ATL::CComPtr<IDispatch> shapes, builder, shape;
+	Status status = GetObject(context.container, L"Shapes", shapes);
+	if (!status.ok())
+		return status;
+	// MsoEditingType msoEditingAuto = 0; MsoSegmentType msoSegmentLine = 0.
+	status = CallObject(shapes, L"BuildFreeform", { ATL::CComVariant(0L),
+		ATL::CComVariant(vertices[0].first), ATL::CComVariant(vertices[0].second) }, builder);
+	for (size_t index = 1; status.ok() && index < vertices.size(); ++index)
+		status = CallMethod(builder, L"AddNodes", { ATL::CComVariant(0L), ATL::CComVariant(0L),
+			ATL::CComVariant(vertices[index].first), ATL::CComVariant(vertices[index].second) });
+	if (status.ok())
+		status = CallObject(builder, L"ConvertToShape", {}, shape);
 	if (!status.ok())
 		return status;
 	long shapeId = 0;

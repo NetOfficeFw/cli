@@ -6,7 +6,7 @@ const path = require('node:path');
 // text (any string), name (non-empty string), file (non-empty path kept as given),
 // absolute (non-empty path resolved against the current directory), boolean (true|false),
 // flag (no value), color (#RRGGBB), ids (comma-separated positive int32 list),
-// list (comma-separated strings), series (Name:1,2;Other:3,4).
+// list (comma-separated strings), series (Name:1,2;Other:3,4), points (x,y;x,y;... at least two).
 const options = {
   '--target': ['target', 'target'], '--slide-id': ['slideId', 'id'], '--shape-id': ['shapeId', 'id'],
   '--master': ['master', 'flag'], '--force': ['force', 'flag'], '--add': ['add', 'flag'],
@@ -53,7 +53,8 @@ const options = {
   '--rows': ['rows', 'id'], '--columns': ['columns', 'id'], '--row': ['row', 'id'], '--column': ['column', 'id'],
   '--fill-color': ['fillColor', 'color'], '--font-color': ['fontColor', 'color'],
   '--font-size': ['fontSize', 'number'], '--chart-type': ['chartType', 'integer'],
-  '--categories': ['categories', 'list'], '--series': ['series', 'series'], '--file': ['file', 'file']
+  '--categories': ['categories', 'list'], '--series': ['series', 'series'], '--file': ['file', 'file'],
+  '--points': ['points', 'points']
 };
 
 const themeColors = ['dark1', 'light1', 'dark2', 'light2', 'accent1', 'accent2', 'accent3', 'accent4',
@@ -130,6 +131,7 @@ const commands = {
   'shape distribute': ['PowerPoint.distributeShapes', ['target', 'slide', 'shapeIds', 'direction'], ['relativeToSlide']],
   'textbox add': ['PowerPoint.addTextbox', ['target', 'slide', ...geometry], ['orientation']],
   'line add': ['PowerPoint.addLine', ['target', 'slide', 'beginX', 'beginY', 'endX', 'endY'], []],
+  'freeform add': ['PowerPoint.addFreeform', ['target', 'slide', 'points'], []],
   'connector add': ['PowerPoint.addConnector', ['target', 'slide', 'connectorType', 'beginX', 'beginY', 'endX', 'endY'], []],
   'connector connect': ['PowerPoint.connectConnector', ['target', 'slide', 'shapeId'],
     ['beginShapeId', 'beginSite', 'endShapeId', 'endSite']],
@@ -285,6 +287,9 @@ except shape animation):
 Content (each add accepts --slide-id <id>, --master, or --custom-layout <index> and returns a shape ID):
   netoffice textbox add --target <id> --slide-id <id> --left <pt> --top <pt> --width <pt> --height <pt> [--orientation horizontal|upward|downward|vertical]
   netoffice line add --target <id> --slide-id <id> --begin-x <pt> --begin-y <pt> --end-x <pt> --end-y <pt>
+  netoffice freeform add --target <id> --slide-id <id> --points "<x>,<y>;<x>,<y>;..."
+    Draw a freeform through the points (pt, at least two distinct) joined by straight segments, in order;
+    repeat the first point last to close it. Returns the shape ID.
   netoffice connector add --target <id> --slide-id <id> --connector-type straight|elbow|curve --begin-x <pt> --begin-y <pt> --end-x <pt> --end-y <pt>
   netoffice connector connect --target <id> --slide-id <id> --shape-id <connector> [--begin-shape-id <id> [--begin-site <n>]] [--end-shape-id <id> [--end-site <n>]]
   netoffice picture add --target <id> --slide-id <id> --path <image> --left <pt> --top <pt> [--width <pt> --height <pt>]
@@ -402,6 +407,15 @@ function parseValue(type, value, option) {
     case 'list':
       if (!value) throw new Error(`${option} requires a comma-separated list.`);
       return value.split(',').map(part => part.trim());
+    case 'points': {
+      const points = value.split(';').map((entry, index) => {
+        const parts = entry.split(',');
+        if (parts.length !== 2) throw new Error(`${option} requires "<x>,<y>" pairs separated by ";" (pair ${index + 1}).`);
+        return { x: finiteNumber(parts[0].trim(), option), y: finiteNumber(parts[1].trim(), option) };
+      });
+      if (points.length < 2) throw new Error(`${option} requires at least two points.`);
+      return points;
+    }
     case 'series':
       return value.split(';').map(entry => {
         const separator = entry.lastIndexOf(':');
